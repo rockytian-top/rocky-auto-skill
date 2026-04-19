@@ -494,9 +494,15 @@ ${scriptBody}
 输出格式：直接输出脚本内容`;
 
   try {
+    // 使用临时文件传递prompt，避免引号转义问题
+    const tmpFile = '/tmp/autoskill_enhance_' + Date.now() + '.txt';
+    writeFileSync(tmpFile, prompt, 'utf-8');
+    
     const result = execSync(`python3 -c "
 import requests
 import json
+with open('${tmpFile}', 'r') as f:
+    prompt = f.read()
 resp = requests.post(
     'https://api.minimaxi.com/anthropic/v1/messages',
     headers={
@@ -508,7 +514,7 @@ resp = requests.post(
     json={
         'model': 'MiniMax-M2.7',
         'max_tokens': 500,
-        'messages': [{'role': 'user', 'content': ${JSON.stringify(prompt)}}]
+        'messages': [{'role': 'user', 'content': prompt}]
     },
     timeout=15
 )
@@ -519,6 +525,9 @@ if content and len(content) > 0:
 else:
     print('ERROR')
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
+
+    // 清理临时文件
+    try { unlinkSync(tmpFile); } catch(e) {}
 
     const trimmed = result.trim();
     if (trimmed === 'ERROR' || !trimmed) {
