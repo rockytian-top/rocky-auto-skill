@@ -266,20 +266,53 @@ function askModelDecision(type, ctx) {
 
 // ==================== 反馈处理函数 ====================
 // 获取最近执行的技能
+// lastExecutedSkill 持久化到文件，避免网关重启后丢失
+const LAST_SKILL_FILE = () => join(getDataDir(), 'last_executed_skill.json');
+
+function loadLastExecutedSkill() {
+  try {
+    if (!existsSync(LAST_SKILL_FILE())) return null;
+    const content = readFileSync(LAST_SKILL_FILE(), 'utf-8');
+    const data = JSON.parse(content);
+    // 检查是否在5分钟窗口内
+    if (Date.now() - data.ts > 5 * 60 * 1000) {
+      try { unlinkSync(LAST_SKILL_FILE()); } catch(e) {}
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function saveLastExecutedSkill(data) {
+  try {
+    writeFileSync(LAST_SKILL_FILE(), JSON.stringify(data), 'utf-8');
+  } catch(e) {
+    console.log('[DEBUG] saveLastExecutedSkill error:', e.message);
+  }
+}
+
 let lastExecutedSkill = null; // { cardId, scriptPath, title, currentScript, ts }
 
 function setLastExecutedSkill(cardId, scriptPath, title, currentScript) {
   lastExecutedSkill = { cardId, scriptPath, title, currentScript, ts: Date.now() };
+  saveLastExecutedSkill(lastExecutedSkill);
   console.log('[DEBUG] setLastExecutedSkill called:', cardId, title, 'expires in 5min');
 }
 
 function getRecentExecutedScript() {
-  if (!lastExecutedSkill) return null;
-  // 5分钟内有效
-  if (Date.now() - lastExecutedSkill.ts > 5 * 60 * 1000) {
-    lastExecutedSkill = null;
-    return null;
+  // 优先从内存获取
+  if (lastExecutedSkill) {
+    if (Date.now() - lastExecutedSkill.ts > 5 * 60 * 1000) {
+      lastExecutedSkill = null;
+      try { unlinkSync(LAST_SKILL_FILE()); } catch(e) {}
+      return null;
+    }
+    return lastExecutedSkill;
   }
+  // 内存没有，从文件恢复
+  lastExecutedSkill = loadLastExecutedSkill();
   return lastExecutedSkill;
 }
 
