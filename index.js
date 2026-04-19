@@ -33,25 +33,26 @@ function getGatewayConfig() {
 }
 
 function getModelCredentials() {
-  // 默认使用 MiniMax 的凭证
+  // 从网关配置读取模型凭证
   const config = getGatewayConfig();
   if (config && config.models && config.models.providers) {
-    // 优先使用 minimax-portal 的配置
+    // 优先使用有完整配置的 provider（baseUrl + apiKey）
+    // zai 配置完整，优先使用
+    const zai = config.models.providers['zai'];
+    if (zai && zai.apiKey) {
+      return {
+        baseUrl: zai.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
+        apiKey: zai.apiKey,
+        authHeader: false
+      };
+    }
+    // minimax-portal 没有 apiKey，需要环境变量
     const minimax = config.models.providers['minimax-portal'];
     if (minimax) {
       return {
         baseUrl: minimax.baseUrl || 'https://api.minimaxi.com/anthropic',
         apiKey: process.env.MINIMAX_API_KEY || '',
         authHeader: minimax.authHeader || false
-      };
-    }
-    // 回退到 zai provider
-    const zai = config.models.providers['zai'];
-    if (zai) {
-      return {
-        baseUrl: zai.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
-        apiKey: zai.apiKey || '',
-        authHeader: false
       };
     }
   }
