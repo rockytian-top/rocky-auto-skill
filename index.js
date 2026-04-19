@@ -43,7 +43,8 @@ function getModelCredentials() {
       return {
         baseUrl: zai.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
         apiKey: zai.apiKey,
-        authHeader: false
+        authHeader: false,
+        apiType: 'openai'  // zai 用 OpenAI 格式
       };
     }
     // minimax-portal 没有 apiKey，需要环境变量
@@ -52,7 +53,8 @@ function getModelCredentials() {
       return {
         baseUrl: minimax.baseUrl || 'https://api.minimaxi.com/anthropic',
         apiKey: process.env.MINIMAX_API_KEY || '',
-        authHeader: minimax.authHeader || false
+        authHeader: minimax.authHeader || false,
+        apiType: 'anthropic'  // minimax-portal 用 Anthropic 格式
       };
     }
   }
@@ -60,7 +62,8 @@ function getModelCredentials() {
   return {
     baseUrl: process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic',
     apiKey: process.env.MINIMAX_API_KEY || '',
-    authHeader: false
+    authHeader: false,
+    apiType: 'anthropic'
   };
 }
 
@@ -479,19 +482,22 @@ ${contextText}
     const creds = getModelCredentials();
     const apiKey = creds.apiKey || process.env.MINIMAX_API_KEY || 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA';
     const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
+    const apiType = creds.apiType || 'anthropic';
     
     // 构建请求头并写入临时文件
     const headers = {
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true'
+      'Content-Type': 'application/json'
     };
+    if (apiType === 'anthropic') {
+      headers['anthropic-version'] = '2023-06-01';
+      headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    }
     if (creds.authHeader) {
       headers['Authorization'] = `Bearer ${apiKey}`;
     } else {
       headers['x-api-key'] = apiKey;
     }
-    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl }), 'utf-8');
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType }), 'utf-8');
     
     const result = execSync(`python3 -W ignore -c "
 import requests
@@ -500,22 +506,43 @@ with open('${tmpFile}', 'r') as f:
     prompt = f.read()
 with open('${credsFile}', 'r') as f:
     creds = json.load(f)
-resp = requests.post(
-    creds['baseUrl'] + '/v1/messages',
-    headers=creds['headers'],
-    json={
-        'model': 'MiniMax-M2.7',
-        'max_tokens': 100,
-        'messages': [{'role': 'user', 'content': prompt}]
-    },
-    timeout=15
-)
-data = resp.json()
-content = data.get('content', [])
-if content and len(content) > 0:
-    print(content[0].get('text', ''))
+
+if creds.get('apiType') == 'openai':
+    # OpenAI 格式
+    resp = requests.post(
+        creds['baseUrl'] + '/chat/completions',
+        headers=creds['headers'],
+        json={
+            'model': 'glm-5.1',
+            'max_tokens': 100,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=15
+    )
+    data = resp.json()
+    choices = data.get('choices', [])
+    if choices and len(choices) > 0:
+        print(choices[0].get('message', {}).get('content', ''))
+    else:
+        print('ERROR')
 else:
-    print('ERROR')
+    # Anthropic 格式
+    resp = requests.post(
+        creds['baseUrl'] + '/v1/messages',
+        headers=creds['headers'],
+        json={
+            'model': 'MiniMax-M2.7',
+            'max_tokens': 100,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=15
+    )
+    data = resp.json()
+    content = data.get('content', [])
+    if content and len(content) > 0:
+        print(content[0].get('text', ''))
+    else:
+        print('ERROR')
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
 
     // 清理临时文件
@@ -597,19 +624,22 @@ ${scriptBody}
     const creds = getModelCredentials();
     const apiKey = creds.apiKey || process.env.MINIMAX_API_KEY || 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA';
     const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
+    const apiType = creds.apiType || 'anthropic';
     
     // 构建请求头并写入临时文件
     const headers = {
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      'anthropic-dangerous-direct-browser-access': 'true'
+      'Content-Type': 'application/json'
     };
+    if (apiType === 'anthropic') {
+      headers['anthropic-version'] = '2023-06-01';
+      headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    }
     if (creds.authHeader) {
       headers['Authorization'] = `Bearer ${apiKey}`;
     } else {
       headers['x-api-key'] = apiKey;
     }
-    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl }), 'utf-8');
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType }), 'utf-8');
     
     const result = execSync(`python3 -W ignore -c "
 import requests
@@ -618,22 +648,43 @@ with open('${tmpFile}', 'r') as f:
     prompt = f.read()
 with open('${credsFile}', 'r') as f:
     creds = json.load(f)
-resp = requests.post(
-    creds['baseUrl'] + '/v1/messages',
-    headers=creds['headers'],
-    json={
-        'model': 'MiniMax-M2.7',
-        'max_tokens': 500,
-        'messages': [{'role': 'user', 'content': prompt}]
-    },
-    timeout=15
-)
-data = resp.json()
-content = data.get('content', [])
-if content and len(content) > 0:
-    print(content[0].get('text', ''))
+
+if creds.get('apiType') == 'openai':
+    # OpenAI 格式
+    resp = requests.post(
+        creds['baseUrl'] + '/chat/completions',
+        headers=creds['headers'],
+        json={
+            'model': 'glm-5.1',
+            'max_tokens': 500,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=15
+    )
+    data = resp.json()
+    choices = data.get('choices', [])
+    if choices and len(choices) > 0:
+        print(choices[0].get('message', {}).get('content', ''))
+    else:
+        print('ERROR')
 else:
-    print('ERROR')
+    # Anthropic 格式
+    resp = requests.post(
+        creds['baseUrl'] + '/v1/messages',
+        headers=creds['headers'],
+        json={
+            'model': 'MiniMax-M2.7',
+            'max_tokens': 500,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=15
+    )
+    data = resp.json()
+    content = data.get('content', [])
+    if content and len(content) > 0:
+        print(content[0].get('text', ''))
+    else:
+        print('ERROR')
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
 
     const trimmed = result.trim();
