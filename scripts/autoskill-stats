@@ -10,7 +10,7 @@ _get_data_dir() {
   if [ -n "${AUTOSKILL_DIR:-}" ]; then
     echo "$AUTOSKILL_DIR"
   elif [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
-    echo "$OPENCLAW_STATE_DIR/.auto-skill"
+    echo "${OPENCLAW_STATE_DIR:-}/.auto-skill"
   else
     echo "$HOME/.openclaw/.auto-skill"
   fi

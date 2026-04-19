@@ -1,0 +1,282 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v3.0.0
+# autoskill-enhance - 改进已有技能脚本
+# =============================================================================
+set -euo pipefail
+
+# 根据 OPENCLAW_STATE_DIR 自动选择数据目录（与 index.js 一致）
+_get_data_dir() {
+  if [ -n "${AUTOSKILL_DIR:-}" ]; then
+    echo "$AUTOSKILL_DIR"
+  elif [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
+    echo "${OPENCLAW_STATE_DIR:-}/.auto-skill"
+  else
+    echo "$HOME/.openclaw/.auto-skill"
+  fi
+}
+DATA_DIR="$(_get_data_dir)"
+CARDS_DIR="$DATA_DIR/cards"
+SKILLS_DIR="$DATA_DIR/skills"
+
+# 颜色
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+usage() {
+  echo "用法: autoskill-enhance <卡片ID> [--feedback \"反馈内容\"]"
+  echo ""
+  echo "选项:"
+  echo "  --feedback \"内容\"   指定改进反馈（如：输出太长，需要过滤）"
+  echo "  --auto              根据上次执行日志自动改进"
+  echo "  --help              显示帮助"
+  echo ""
+  echo "示例:"
+  echo "  autoskill-enhance 046 --feedback \"需要加上 sudo\""
+  echo "  autoskill-enhance 046 --auto"
+  exit 0
+}
+
+# 解析参数
+CARD_ID=""
+FEEDBACK=""
+AUTO_MODE=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --feedback)
+      FEEDBACK="$2"
+      shift 2
+      ;;
+    --auto)
+      AUTO_MODE=true
+      shift
+      ;;
+    --help|-h)
+      usage
+      ;;
+    *)
+      CARD_ID="$1"
+      shift
+      ;;
+  esac
+done
+
+if [ -z "$CARD_ID" ]; then
+  echo -e "${RED}错误: 请指定卡片ID${NC}"
+  usage
+fi
+
+# 去掉前导零，再补齐3位
+CARD_ID=$(printf '%03d' "$((10#$CARD_ID))")
+
+# 查找卡片文件
+CARD_FILE=""
+for f in "$CARDS_DIR"/${CARD_ID}-*.yaml; do
+  if [ -f "$f" ]; then
+    CARD_FILE="$f"
+    break
+  fi
+done
+
+if [ -z "$CARD_FILE" ]; then
+  echo -e "${RED}错误: 找不到卡片 $CARD_ID${NC}"
+  exit 1
+fi
+
+# 读取卡片信息
+CARD_NAME=$(basename "$CARD_FILE" .yaml)
+TITLE=$(grep '^title:' "$CARD_FILE" | head -1 | sed 's/^title: *//')
+
+# 查找关联脚本
+SCRIPT_FILE=""
+# 先检查 autoInstall 配置
+if grep -q '^autoInstall:' "$CARD_FILE"; then
+  SCRIPT_PATH=$(grep '^autoInstall:' "$CARD_FILE" | sed 's/^autoInstall: *//')
+  if [ -f "$SCRIPT_PATH" ]; then
+    SCRIPT_FILE="$SCRIPT_PATH"
+  fi
+fi
+
+# 再检查 skills 目录
+if [ -z "$SCRIPT_FILE" ]; then
+  for s in "$SKILLS_DIR"/${CARD_ID}-*.sh; do
+    if [ -f "$s" ]; then
+      SCRIPT_FILE="$s"
+      break
+    fi
+  done
+fi
+
+if [ -z "$SCRIPT_FILE" ]; then
+  echo -e "${RED}错误: 卡片 $CARD_ID 没有关联的脚本文件${NC}"
+  echo -e "${YELLOW}提示: 请先用 autoskill-create 创建脚本${NC}"
+  exit 1
+fi
+
+echo -e "${GREEN}=== 改进技能脚本 ===${NC}"
+echo "卡片: [$CARD_ID] $TITLE"
+echo "脚本: $SCRIPT_FILE"
+
+# 如果是自动模式，从日志获取反馈
+if [ "$AUTO_MODE" = true ] && [ -z "$FEEDBACK" ]; then
+  LOG_FILE="$DATA_DIR/logs/${CARD_ID}.log"
+  if [ -f "$LOG_FILE" ]; then
+    LAST_ERROR=$(tail -5 "$LOG_FILE" | grep -i "error\|failed\|fail" | tail -1)
+    if [ -n "$LAST_ERROR" ]; then
+      FEEDBACK="上次执行出错: $LAST_ERROR"
+      echo -e "${YELLOW}自动检测到错误: $FEEDBACK${NC}"
+    else
+      echo -e "${YELLOW}日志中未发现明显错误，请手动指定 --feedback${NC}"
+      exit 0
+    fi
+  else
+    echo -e "${YELLOW}没有执行日志，请手动指定 --feedback${NC}"
+    exit 0
+  fi
+fi
+
+if [ -z "$FEEDBACK" ]; then
+  echo -e "${RED}错误: 请指定 --feedback 或 --auto${NC}"
+  exit 1
+fi
+
+echo "反馈: $FEEDBACK"
+echo ""
+
+# 备份当前脚本
+BACKUP_DIR="$DATA_DIR/backups"
+mkdir -p "$BACKUP_DIR"
+BACKUP_FILE="$BACKUP_DIR/${CARD_NAME}.$(date +%Y%m%d_%H%M%S).sh"
+cp "$SCRIPT_FILE" "$BACKUP_FILE"
+echo -e "${GREEN}已备份到: $BACKUP_FILE${NC}"
+
+# 读取当前脚本内容
+CURRENT_SCRIPT=$(cat "$SCRIPT_FILE")
+
+# 创建改进 prompt
+PROMPT="你是一个shell脚本专家。只输出脚本代码，不要输出任何解释。
+
+当前脚本：
+${CURRENT_SCRIPT}
+
+用户反馈：${FEEDBACK}
+
+请根据反馈修改脚本，直接输出修改后的完整脚本："
+
+# 写入临时文件
+TMP_PROMPT="/tmp/autoskill_enhance_$$.txt"
+echo "$PROMPT" > "$TMP_PROMPT"
+
+echo -e "${YELLOW}正在改进脚本...${NC}"
+
+# 读取 openclaw 配置获取 API 信息
+CONFIG_FILE="$HOME/.openclaw/openclaw.json"
+if [ -n "${OPENCLAW_STATE_DIR:-}" ]; then
+  CONFIG_FILE="${OPENCLAW_STATE_DIR:-}/openclaw.json"
+fi
+
+# 尝试使用内置的 python 增强
+RESULT=$(python3 -W ignore -c "
+import json, sys
+
+try:
+    with open('$TMP_PROMPT', 'r') as f:
+        prompt = f.read()
+    
+    # 读取配置获取 API 信息
+    try:
+        with open('$CONFIG_FILE', 'r') as f:
+            config = json.load(f)
+    except:
+        config = {}
+    
+    # 获取模型配置
+    providers = config.get('providers', {})
+    model = config.get('agents', {}).get('defaults', {}).get('model', '')
+    
+    # 尝试读取 API key
+    api_key = ''
+    base_url = 'https://api.minimaxi.com/anthropic'
+    api_type = 'anthropic'
+    
+    # 尝试各种 provider
+    for pname, pconf in providers.items():
+        if isinstance(pconf, dict):
+            if pconf.get('apiKey'):
+                api_key = pconf['apiKey']
+                base_url = pconf.get('baseURL', pconf.get('base_url', base_url))
+                break
+    
+    if not api_key:
+        print('NO_API_KEY')
+        sys.exit(0)
+    
+    import requests
+    
+    headers = {'Content-Type': 'application/json'}
+    if api_type == 'anthropic':
+        headers['anthropic-version'] = '2023-06-01'
+        headers['x-api-key'] = api_key
+        resp = requests.post(
+            base_url + '/v1/messages',
+            headers=headers,
+            json={
+                'model': model or 'claude-3-5-haiku-20241022',
+                'max_tokens': 1000,
+                'messages': [{'role': 'user', 'content': prompt}]
+            },
+            timeout=30
+        )
+        data = resp.json()
+        content = data.get('content', [])
+        for c in content:
+            if c.get('type') == 'text':
+                print(c.get('text', ''))
+                break
+        else:
+            print('ERROR')
+    else:
+        resp = requests.post(
+            base_url + '/chat/completions',
+            headers={'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'},
+            json={
+                'model': model,
+                'max_tokens': 1000,
+                'messages': [{'role': 'user', 'content': prompt}]
+            },
+            timeout=30
+        )
+        data = resp.json()
+        choices = data.get('choices', [])
+        if choices:
+            print(choices[0].get('message', {}).get('content', 'ERROR'))
+        else:
+            print('ERROR')
+except Exception as e:
+    print(f'ERROR: {e}')
+" 2>&1)
+
+rm -f "$TMP_PROMPT"
+
+if echo "$RESULT" | grep -q "^ERROR\|^NO_API_KEY"; then
+  echo -e "${RED}改进失败: $RESULT${NC}"
+  echo -e "${YELLOW}脚本已备份，未修改${NC}"
+  exit 1
+fi
+
+# 清理结果（去除 markdown 格式）
+CLEANED=$(echo "$RESULT" | sed '/^```/d' | sed '/^```bash/d' | sed '/^```sh/d')
+
+# 写入新脚本
+echo "$CLEANED" > "$SCRIPT_FILE"
+chmod +x "$SCRIPT_FILE"
+
+echo -e "${GREEN}=== 改进完成！${NC}"
+echo ""
+echo "旧版本备份: $BACKUP_FILE"
+echo "新脚本已写入: $SCRIPT_FILE"
+echo ""
+echo "如需回滚: cp $BACKUP_FILE $SCRIPT_FILE"
