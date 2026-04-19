@@ -177,72 +177,91 @@ function detectContextScriptModification(userMsg, messages, recentSkill) {
   return { cardId, scriptPath, title, currentScript, enhancement };
 }
 
-// ==================== 通用脚本增强函数（网关级别） ====================
+// ==================== 智能脚本增强（模型驱动） ====================
 function applyScriptEnhancement(title, currentScript, enhancement) {
-  // 通用增强逻辑：不限定技能类型，根据用户需求智能增强
-  const enhLower = (enhancement || '').toLowerCase();
-
-  // 常见的增强关键词 → 对应命令
-  const enhancementMap = {
-    'swap': 'swapon --show && echo "---" && ',
-    '交换': 'swapon --show && echo "---" && ',
-    '磁盘': 'df -h && echo "---" && ',
-    '硬盘': 'df -h && echo "---" && ',
-    'disk': 'df -h && echo "---" && ',
-    '内存': 'free -h && echo "---" && ',
-    'mem': 'free -h && echo "---" && ',
-    'cpu': 'lscpu && echo "---" && ',
-    '进程': 'ps aux && echo "---" && ',
-    'process': 'ps aux && echo "---" && ',
-    '网络': 'netstat -tuln && echo "---" && ',
-    'net': 'netstat -tuln && echo "---" && ',
-    '端口': 'netstat -tuln && echo "---" && ',
-    'port': 'netstat -tuln && echo "---" && ',
-    '连接': 'ss -tuln && echo "---" && ',
-    '服务': 'systemctl list-units --type=service && echo "---" && ',
-    'service': 'systemctl list-units --type=service && echo "---" && ',
-    '日志': 'journalctl -n 20 && echo "---" && ',
-    'log': 'journalctl -n 20 && echo "---" && ',
-    '错误': 'dmesg | tail -20 && echo "---" && ',
-    'error': 'dmesg | tail -20 && echo "---" && ',
-    'top': 'top -b -n 1 | head -20 && echo "---" && ',
-    '负载': 'uptime && echo "---" && w && echo "---" && ',
-    'load': 'uptime && echo "---" && w && echo "---" && ',
-    'io': 'iostat -x 1 1 && echo "---" && ',
-    '磁盘io': 'iostat -x 1 1 && echo "---" && ',
-    '网络io': 'sar -n DEV 1 1 && echo "---" && '
-  };
-
-  // 找到匹配的增强关键词
-  let prefixCmd = '';
-  for (const [keyword, cmd] of Object.entries(enhancementMap)) {
-    if (enhLower.includes(keyword)) {
-      prefixCmd = cmd;
+  // 提取shebang和注释
+  const lines = currentScript.split('\n');
+  const shebangLines = [];
+  let bodyStartIdx = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#!') || lines[i].startsWith('#')) {
+      shebangLines.push(lines[i]);
+      bodyStartIdx = i + 1;
+    } else {
       break;
     }
   }
+  const scriptBody = lines.slice(bodyStartIdx).join('\n').trim();
 
-  if (!prefixCmd) {
-    console.log('[DEBUG] applyScriptEnhancement: no matching enhancement for:', enhancement);
+  // 提取问题描述
+  const problemMatch = currentScript.match(/#\s*Problem:\s*(.+)/i);
+  const problem = problemMatch ? problemMatch[1].trim() : (title || '未知问题');
+
+  // 构建prompt让模型决定如何增强
+  const prompt = `你是一个Linux shell脚本专家。
+
+当前脚本：
+${scriptBody}
+
+用户想要增强："${enhancement}"
+
+问题背景：${problem}
+
+请生成增强后的完整shell脚本（保留shebang和注释，只修改脚本body）。
+要求：
+1. 在原脚本基础上智能增强，不要完全重写
+2. 添加用户要求的增强功能
+3. 用 && 或 || 连接多个命令
+4. 只输出脚本内容，不要解释
+
+输出格式：直接输出脚本内容`;
+
+  try {
+    const result = execSync(`python3 -c "
+import requests
+import json
+resp = requests.post(
+    'https://api.minimaxi.com/anthropic/v1/messages',
+    headers={
+        'Content-Type': 'application/json',
+        'x-api-key': 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA',
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    json={
+        'model': 'MiniMax-M2.7',
+        'max_tokens': 500,
+        'messages': [{'role': 'user', 'content': ${JSON.stringify(prompt)}}]
+    },
+    timeout=15
+)
+data = resp.json()
+content = data.get('content', [])
+if content and len(content) > 0:
+    print(content[0].get('text', ''))
+else:
+    print('ERROR')
+" 2>&1`, { encoding: 'utf-8', timeout: 20000 });
+
+    const trimmed = result.trim();
+    if (trimmed === 'ERROR' || !trimmed) {
+      console.log('[DEBUG] applyScriptEnhancement: LLM call failed');
+      return currentScript;
+    }
+
+    // 重建完整脚本（保留shebang和注释）
+    const newBody = trimmed.replace(/^#!/,'echo "skip" && #!').split('\n').filter(l => !l.match(/^echo "skip"/)).join('\n');
+    const newScript = shebangLines.length > 0
+      ? shebangLines.join('\n') + '\n' + newBody
+      : newBody;
+
+    console.log('[DEBUG] applyScriptEnhancement: LLM generated new script');
+    return newScript;
+
+  } catch(e) {
+    console.log('[DEBUG] applyScriptEnhancement error:', e.message);
     return currentScript;
   }
-
-  // 如果当前脚本已经有类似的命令，不再重复添加
-  if (currentScript.includes(prefixCmd.trim())) {
-    console.log('[DEBUG] applyScriptEnhancement: command already exists');
-    return currentScript;
-  }
-
-  // 在脚本开头添加增强命令（添加分隔符）
-  const shebang = currentScript.startsWith('#!') ? currentScript.split('\n').slice(0, 2).join('\n') + '\n' : '';
-  const scriptBody = shebang ? currentScript.split('\n').slice(2).join('\n') : currentScript;
-
-  const newScript = shebang
-    ? shebang + prefixCmd + scriptBody
-    : prefixCmd + scriptBody;
-
-  console.log('[DEBUG] applyScriptEnhancement: applied:', enhancement, '-> prefix:', prefixCmd.trim());
-  return newScript;
 }
 
 // 根据反馈生成新脚本
