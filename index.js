@@ -319,9 +319,15 @@ ${contextText}
 - 如果不需要："不需要增强"`;
 
   try {
+    // 使用临时文件传递prompt，避免引号转义问题
+    const tmpFile = '/tmp/autoskill_prompt_' + Date.now() + '.txt';
+    writeFileSync(tmpFile, prompt, 'utf-8');
+    
     const result = execSync(`python3 -c "
 import requests
 import json
+with open('${tmpFile}', 'r') as f:
+    prompt = f.read()
 resp = requests.post(
     'https://api.minimaxi.com/anthropic/v1/messages',
     headers={
@@ -333,7 +339,7 @@ resp = requests.post(
     json={
         'model': 'MiniMax-M2.7',
         'max_tokens': 100,
-        'messages': [{'role': 'user', 'content': ${JSON.stringify(prompt)}}]
+        'messages': [{'role': 'user', 'content': prompt}]
     },
     timeout=15
 )
@@ -344,6 +350,9 @@ if content and len(content) > 0:
 else:
     print('ERROR')
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
+
+    // 清理临时文件
+    try { unlinkSync(tmpFile); } catch(e) {}
 
     const trimmed = result.trim();
     console.log('[DEBUG] LLM enhancement check:', trimmed.slice(0, 100));
