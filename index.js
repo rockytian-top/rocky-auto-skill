@@ -85,6 +85,28 @@ function getModelCredentials() {
 const MAX_BACKUP_VERSIONS = 2;
 
 /**
+ * 转义 bash 特殊字符
+ * @param {string} str - 待转义字符串
+ * @returns {string} - 转义后的字符串
+ */
+function bashEscape(str) {
+  if (!str) return '';
+  // 先转义反斜杠，再转义双引号和美元符号
+  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`');
+}
+
+/**
+ * 带环境变量的 execSync 调用
+ */
+function execSyncWithEnv(cmd, options = {}) {
+  const env = {
+    ...process.env,
+    OPENCLAW_STATE_DIR: process.env.OPENCLAW_STATE_DIR || (process.env.HOME + '/.openclaw')
+  };
+  return execSync(cmd, { ...options, env });
+}
+
+/**
  * 备份当前脚本版本
  * @param {string} scriptPath - 脚本完整路径
  * @returns {boolean} - 是否成功
@@ -1586,7 +1608,7 @@ function autoExecuteScript(scriptPath, cardId, title) {
 // ==================== 自动 hit 计数 ====================
 function autoHit(cardId, scriptsDir) {
   try {
-    execSync(`bash "${scriptsDir}/autoskill-hit" ${cardId} 2>&1`, {
+    execSyncWithEnv(`bash "${scriptsDir}/autoskill-hit" ${cardId} 2>&1`, {
       timeout: 10000, encoding: 'utf-8'
     });
     return true;
@@ -2035,7 +2057,7 @@ module.exports = {
           const safeSolution = extractedSolution.replace(/[#*`$\\]/g, '').slice(0, 500);
           const recordCmd = `bash "${scriptsDir}/autoskill-record" --title "${safeTitle}" --tool "qq" --problem "${safeProblem}" --solution "${safeSolution}" 2>&1`;
           console.log('[DEBUG] natural record cmd:', recordCmd.slice(0, 100));
-          const recordOutput = execSync(recordCmd, { encoding: 'utf-8', timeout: 10000 });
+          const recordOutput = execSyncWithEnv(recordCmd, { encoding: 'utf-8', timeout: 10000 });
           console.log('[DEBUG] natural record output:', recordOutput.slice(0, 200));
 
           result.prependContext = `✅ 已记录经验卡片：
@@ -2064,7 +2086,7 @@ ${statsOutput}
         else if (hasListIntent) {
           console.log('[DEBUG] natural language list intent detected:', userMsg.slice(0, 50));
           const listCmd = `bash "${scriptsDir}/autoskill-list" 2>&1`;
-          const listOutput = execSync(listCmd, { encoding: 'utf-8', timeout: 10000 });
+          const listOutput = execSyncWithEnv(listCmd, { encoding: 'utf-8', timeout: 10000 });
           result.prependContext = `📋 经验列表：
 ${listOutput}
 
@@ -2076,7 +2098,7 @@ ${listOutput}
           const keyword = searchMatch[2].trim();
           console.log('[DEBUG] natural language search intent detected:', keyword);
           const searchCmd = `bash "${scriptsDir}/autoskill-search" "${keyword}" 2>&1`;
-          const searchOutput = execSync(searchCmd, { encoding: 'utf-8', timeout: 10000 });
+          const searchOutput = execSyncWithEnv(searchCmd, { encoding: 'utf-8', timeout: 10000 });
           result.prependContext = `🔍 搜索"${keyword}"结果：
 ${searchOutput}
 
@@ -2088,12 +2110,15 @@ ${searchOutput}
           console.log('[DEBUG] natural language hit intent detected:', userMsg.slice(0, 50));
           // 获取最新创建的卡片ID
           const listCmd = `bash "${scriptsDir}/autoskill-list" 2>&1`;
-          const listOutput = execSync(listCmd, { encoding: 'utf-8', timeout: 10000 });
-          const idMatch = listOutput.match(/ID:\s*(\d+)/);
+          console.log('[DEBUG] hit listCmd:', listCmd.slice(0, 100));
+          const listOutput = execSyncWithEnv(listCmd, { encoding: 'utf-8', timeout: 10000 });
+          console.log('[DEBUG] hit listOutput:', listOutput.slice(0, 200));
+          const idMatch = listOutput.match(/[🟡🔴🟠]\s*\[(\d+)\]/);
+          console.log('[DEBUG] hit idMatch:', idMatch ? idMatch[1] : 'NULL');
           if (idMatch) {
             const cardId = idMatch[1];
             const hitCmd = `bash "${scriptsDir}/autoskill-hit" ${cardId} 2>&1`;
-            const hitOutput = execSync(hitCmd, { encoding: 'utf-8', timeout: 10000 });
+            const hitOutput = execSyncWithEnv(hitCmd, { encoding: 'utf-8', timeout: 10000 });
             result.prependContext = `👍 已标记卡片 #${cardId} 为有用！
 ${hitOutput}
 
@@ -2270,8 +2295,8 @@ ${hitOutput}
             if (decision.decision === 'yes') {
               try {
                 const safeTitle = (decision.title || userMsg.slice(0, 30)).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '-');
-                const recordCmd = `bash "${scriptsDir}/autoskill-record" --title "${safeTitle}" --tool "ai" --problem "${userMsg}" --solution "待补充" 2>&1`;
-                const recordOutput = execSync(recordCmd, { encoding: 'utf-8', timeout: 10000 });
+                const recordCmd = `bash "${scriptsDir}/autoskill-record" --title "${safeTitle}" --tool "ai" --problem "${bashEscape(userMsg)}" --solution "待补充" 2>&1`;
+                const recordOutput = execSyncWithEnv(recordCmd, { encoding: 'utf-8', timeout: 10000 });
                 console.log('[DEBUG] model-driven auto-created card:', decision.reason, recordOutput.slice(0, 100));
                 cache.ts = 0;
               } catch(e) {
@@ -2334,7 +2359,7 @@ ${hitOutput}
           // 记录执行结果（方案E）
           try {
             const logResult = execResult.success ? 'success' : 'failed';
-            execSync(`bash "${scriptsDir}/autoskill-log" ${r.id} ${logResult}`, {
+            execSyncWithEnv(`bash "${scriptsDir}/autoskill-log" ${r.id} ${logResult}`, {
               timeout: 5000, encoding: 'utf-8'
             });
           } catch {}
