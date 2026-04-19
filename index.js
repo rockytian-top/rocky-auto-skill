@@ -1117,6 +1117,87 @@ module.exports = {
       const userMsg = extractUserMessageKeywordsFromPrompt(userMsgStr);
       console.log("[DEBUG] extracted userMsg:", JSON.stringify(userMsg), "len:", userMsg.length);
 
+      // ========== 自然语言记录意图检测 ==========
+      // 检测用户是否想记录经验（如："帮我记录..."、"记一下..."、"备忘..."）
+      const recordIntentPatterns = [
+        /^\s*(帮我)?记录(一个)?经验/,
+        /^\s*记一下/,
+        /^\s*备忘/,
+        /^\s*把这个记下来/,
+        /^\s*记录一下/,
+        /^\s*我要记录/,
+        /^\s*想记录/,
+        /^\s*记个/,
+        /^\s*记笔记/,
+        /^\s*收藏/,
+        /^\s*抄下来/,
+        /^\s*存档/
+      ];
+      const hasRecordIntent = recordIntentPatterns.some(p => p.test(userMsg));
+      if (hasRecordIntent) {
+        console.log('[DEBUG] natural language record intent detected:', userMsg.slice(0, 50));
+        // 使用 LLM 提取结构化信息
+        try {
+          const model = event.model || 'minimax-portal/MiniMax-M2.7-highspeed';
+          const extractPrompt = `从用户消息中提取经验卡片的3个字段：title（标题，10字内）、problem（问题描述）、solution（解决方案）。
+用户消息："${userMsg}"
+
+请直接返回以下格式（不要任何解释）：
+title: <标题>
+problem: <问题>
+solution: <方案>`;
+          
+          // 调用 LLM 提取信息（使用 OpenClaw 的 fetch API）
+          const fetch = globalThis.fetch || require('node-fetch');
+          const apiBase = 'http://127.0.0.1:18789';
+          const resp = await fetch(`${apiBase}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: model,
+              messages: [{ role: 'user', content: extractPrompt }],
+              max_tokens: 200,
+              temperature: 0.1
+            }),
+            signal: AbortSignal.timeout(10000)
+          });
+          const json = await resp.json();
+          const content = json?.choices?.[0]?.message?.content || '';
+          console.log('[DEBUG] LLM extract result:', content);
+          
+          // 解析 LLM 输出
+          const titleMatch = content.match(/title:\s*(.+)/i);
+          const problemMatch = content.match(/problem:\s*(.+)/i);
+          const solutionMatch = content.match(/solution:\s*(.+)/i);
+          
+          const extractedTitle = (titleMatch?.[1] || userMsg.slice(0, 20)).trim();
+          const extractedProblem = (problemMatch?.[1] || userMsg).trim();
+          const extractedSolution = (solutionMatch?.[1] || '待补充').trim();
+          
+          // 调用 autoskill-record
+          const safeTitle = extractedTitle.replace(/[#*`$\\]/g, '').slice(0, 50);
+          const safeProblem = extractedProblem.replace(/[#*`$\\]/g, '').slice(0, 500);
+          const safeSolution = extractedSolution.replace(/[#*`$\\]/g, '').slice(0, 500);
+          const recordCmd = `bash "${scriptsDir}/autoskill-record" --title "${safeTitle}" --tool "qq" --problem "${safeProblem}" --solution "${safeSolution}" 2>&1`;
+          console.log('[DEBUG] natural record cmd:', recordCmd.slice(0, 100));
+          const recordOutput = execSync(recordCmd, { encoding: 'utf-8', timeout: 10000 });
+          console.log('[DEBUG] natural record output:', recordOutput.slice(0, 200));
+          
+          result.prependContext = `✅ 已通过自然语言记录经验卡片：
+📌 标题：${safeTitle}
+📋 问题：${safeProblem.slice(0, 50)}...
+🔧 方案：${safeSolution.slice(0, 50)}...
+
+卡片ID：${recordOutput.match(/id:\s*(\d+)/)?.[1] || '未知'}
+
+---
+`;
+          cache.ts = 0; // 使缓存失效
+        } catch(e) {
+          console.log('[DEBUG] natural record error:', e.message);
+        }
+      }
+
       // ========== 工作流模式检测（模型分析） ==========
       const sessionKey = event.sessionKey || 'default';
       // 将消息历史发送给模型判断
