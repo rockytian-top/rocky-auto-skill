@@ -17,7 +17,7 @@ const { existsSync, readFileSync, readdirSync, statSync, writeFileSync, chmodSyn
 const { join } = require('path');
 
 // ==================== 脚本版本备份 ====================
-const MAX_BACKUP_VERSIONS = 5;
+const MAX_BACKUP_VERSIONS = 2;
 
 /**
  * 备份当前脚本版本
