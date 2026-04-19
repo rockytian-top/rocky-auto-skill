@@ -1,6 +1,0 @@
-#!/bin/bash
-# rocky-auto-skill v2.4.1
-# autoskill-search - 混合搜索引擎 wrapper
-set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec python3 "${SCRIPT_DIR}/autoskill-search.py" "$@"
