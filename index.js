@@ -32,10 +32,41 @@ function getGatewayConfig() {
   return null;
 }
 
+// 模块级变量，存储当前 sessionKey（在 before_agent_start 中设置）
+let _currentSessionKey = null;
+
+// 从 sessionKey 解析 agent 名称并获取其 model
+// sessionKey 格式: agent:xiaoying:onebot:xxx 或 agent:fs-daying:main
+function getAgentModelFromSession(sessionKey) {
+  if (!sessionKey) return null;
+  // 格式: agent:agentName:...
+  const match = sessionKey.match(/^agent:([^:]+):/);
+  if (!match) return null;
+  const agentName = match[1];
+
+  const config = getGatewayConfig();
+  if (!config || !config.agents || !config.agents.list) return null;
+
+  // 遍历 agents 找匹配的
+  for (const agent of config.agents.list) {
+    if (agent.id === agentName || agent.name === agentName) {
+      if (agent.model && agent.model.includes('/')) {
+        return agent.model;
+      }
+    }
+  }
+  return null;
+}
+
 function getModelCredentials(agentModel) {
   // agentModel 格式: "provider/model" 如 "minimax-portal/MiniMax-M2.7-highspeed"
   // 优先使用 agent 实际使用的模型，保持一致
   const config = getGatewayConfig();
+
+  // 如果没有提供 agentModel，尝试从当前 sessionKey 获取
+  if (!agentModel && _currentSessionKey) {
+    agentModel = getAgentModelFromSession(_currentSessionKey);
+  }
 
   // 如果提供了 agentModel，解析出 provider
   let targetProvider = null;
@@ -1994,6 +2025,11 @@ module.exports = {
 
     api.on('before_agent_start', (event) => {
       console.log("[DEBUG] HOOK FIRING, event keys:", Object.keys(event || {}));
+      _currentSessionKey = event.sessionKey || null; // 设置当前 sessionKey，供 getModelCredentials 使用
+      if (_currentSessionKey) {
+        const agentModel = getAgentModelFromSession(_currentSessionKey);
+        if (agentModel) console.log('[DEBUG] agent model from session:', agentModel);
+      }
       let result = null;
       try {
       const scriptsDir = getScriptsDir();
