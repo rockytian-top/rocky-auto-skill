@@ -591,7 +591,13 @@ else:
     data = resp.json()
     content = data.get('content', [])
     if content and len(content) > 0:
-        print(content[0].get('text', ''))
+        # 遍历找到 text 类型
+        for c in content:
+            if c.get('type') == 'text':
+                print(c.get('text', ''))
+                break
+        else:
+            print('ERROR')
     else:
         print('ERROR')
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
@@ -740,7 +746,13 @@ else:
     data = resp.json()
     content = data.get('content', [])
     if content and len(content) > 0:
-        print(content[0].get('text', ''))
+        # 遍历找到 text 类型
+        for c in content:
+            if c.get('type') == 'text':
+                print(c.get('text', ''))
+                break
+        else:
+            print('ERROR')
     else:
         print('ERROR')
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
@@ -1088,7 +1100,14 @@ resp = requests.post(
     },
     timeout=60
 )
-print(resp.json()['content'][0]['text'][:4000])
+# 处理可能包含 thinking 类型的响应
+content = resp.json().get('content', [])
+for c in content:
+    if c.get('type') == 'text':
+        print(c.get('text', '')[:4000])
+        break
+else:
+    print('ERROR')
 `;
 
     const result = execSync(`python3 -W ignore -c "${pythonScript}" 2>/dev/null`, { encoding: 'utf-8', timeout: 70000 });
@@ -1227,7 +1246,14 @@ resp = requests.post(
     },
     timeout=60
 )
-print(resp.json()['content'][0]['text'][:4000])
+# 处理可能包含 thinking 类型的响应
+content = resp.json().get('content', [])
+for c in content:
+    if c.get('type') == 'text':
+        print(c.get('text', '')[:4000])
+        break
+else:
+    print('ERROR')
 `;
 
     const result = execSync(`python3 -W ignore -c "${pythonScript}" 2>/dev/null`, { encoding: 'utf-8', timeout: 70000 });
