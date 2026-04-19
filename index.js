@@ -1117,8 +1117,8 @@ module.exports = {
       const userMsg = extractUserMessageKeywordsFromPrompt(userMsgStr);
       console.log("[DEBUG] extracted userMsg:", JSON.stringify(userMsg), "len:", userMsg.length);
 
-      // ========== 自然语言记录意图检测 ==========
-      // 检测用户是否想记录经验（如："帮我记录..."、"记一下..."、"备忘..."）
+      // ========== 自然语言意图检测 ==========
+      // ---------- 记录意图 ----------
       const recordIntentPatterns = [
         /^\s*(帮我)?记录(一个)?经验/,
         /^\s*记一下/,
@@ -1134,47 +1134,73 @@ module.exports = {
         /^\s*存档/
       ];
       const hasRecordIntent = recordIntentPatterns.some(p => p.test(userMsg));
-      if (hasRecordIntent) {
-        console.log('[DEBUG] natural language record intent detected:', userMsg.slice(0, 50));
-        // 使用 LLM 提取结构化信息
-        try {
-          const model = event.model || 'minimax-portal/MiniMax-M2.7-highspeed';
-          const extractPrompt = `从用户消息中提取经验卡片的3个字段：title（标题，10字内）、problem（问题描述）、solution（解决方案）。
-用户消息："${userMsg}"
 
-请直接返回以下格式（不要任何解释）：
-title: <标题>
-problem: <问题>
-solution: <方案>`;
-          
-          // 调用 LLM 提取信息（使用 OpenClaw 的 fetch API）
-          const fetch = globalThis.fetch || require('node-fetch');
-          const apiBase = 'http://127.0.0.1:18789';
-          const resp = await fetch(`${apiBase}/v1/chat/completions`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              model: model,
-              messages: [{ role: 'user', content: extractPrompt }],
-              max_tokens: 200,
-              temperature: 0.1
-            }),
-            signal: AbortSignal.timeout(10000)
-          });
-          const json = await resp.json();
-          const content = json?.choices?.[0]?.message?.content || '';
-          console.log('[DEBUG] LLM extract result:', content);
-          
-          // 解析 LLM 输出
-          const titleMatch = content.match(/title:\s*(.+)/i);
-          const problemMatch = content.match(/problem:\s*(.+)/i);
-          const solutionMatch = content.match(/solution:\s*(.+)/i);
-          
-          const extractedTitle = (titleMatch?.[1] || userMsg.slice(0, 20)).trim();
-          const extractedProblem = (problemMatch?.[1] || userMsg).trim();
-          const extractedSolution = (solutionMatch?.[1] || '待补充').trim();
-          
-          // 调用 autoskill-record
+      // ---------- 统计意图 ----------
+      const statsIntentPatterns = [
+        /^\s*(帮我)?查看?统计/,
+        /^\s*统计(一下)?/,
+        /^\s*状态/,
+        /^\s*情况/,
+        /^\s*看看.*情况/,
+        /^\s*有什么/,
+        /^\s*查看/,
+        /^\s*查看经验/,
+        /^\s*经验列表/
+      ];
+      const hasStatsIntent = statsIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
+
+      // ---------- 列表意图 ----------
+      const listIntentPatterns = [
+        /^\s*(帮我)?列出(所有)?经验/,
+        /^\s*列表/,
+        /^\s*经验列表/,
+        /^\s*所有经验/,
+        /^\s*有哪些/,
+        /^\s*看看列表/
+      ];
+      const hasListIntent = listIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
+
+      // ---------- 搜索意图 ----------
+      const searchMatch = userMsg.match(/^(搜索|找|查找|查询)\s*(.+)/);
+
+      // ---------- 命中意图 ----------
+      const hitIntentPatterns = [
+        /^\s*(这个)?有用/,
+        /^\s*(帮我)?标记.*有用/,
+        /^\s*(帮我)?标记/,
+        /^\s*hit/,
+        /^\s*点赞/,
+        /^\s*喜欢/,
+        /^\s*收藏/,
+        /^\s*记住了/
+      ];
+      const hasHitIntent = hitIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
+
+      // ========== 执行自然语言命令 ==========
+      try {
+        // ----- 记录意图 -----
+        if (hasRecordIntent) {
+          console.log('[DEBUG] natural language record intent detected:', userMsg.slice(0, 50));
+          let extractedTitle = userMsg;
+          let extractedProblem = userMsg;
+          let extractedSolution = '待补充';
+
+          const colonMatch = userMsg.match(/[：:]\s*(.+)/);
+          if (colonMatch) {
+            const content = colonMatch[1].trim();
+            if (content.includes('，') || content.includes(',')) {
+              const parts = content.split(/[，,]/);
+              extractedTitle = parts[0].trim();
+              extractedProblem = content.trim();
+              if (parts[1] && parts[1].trim() !== '') {
+                extractedSolution = parts[1].trim();
+              }
+            } else {
+              extractedTitle = content.slice(0, 20);
+              extractedProblem = content;
+            }
+          }
+
           const safeTitle = extractedTitle.replace(/[#*`$\\]/g, '').slice(0, 50);
           const safeProblem = extractedProblem.replace(/[#*`$\\]/g, '').slice(0, 500);
           const safeSolution = extractedSolution.replace(/[#*`$\\]/g, '').slice(0, 500);
@@ -1182,20 +1208,73 @@ solution: <方案>`;
           console.log('[DEBUG] natural record cmd:', recordCmd.slice(0, 100));
           const recordOutput = execSync(recordCmd, { encoding: 'utf-8', timeout: 10000 });
           console.log('[DEBUG] natural record output:', recordOutput.slice(0, 200));
-          
-          result.prependContext = `✅ 已通过自然语言记录经验卡片：
+
+          result.prependContext = `✅ 已记录经验卡片：
 📌 标题：${safeTitle}
-📋 问题：${safeProblem.slice(0, 50)}...
-🔧 方案：${safeSolution.slice(0, 50)}...
+📋 问题：${safeProblem.slice(0, 50)}${safeProblem.length > 50 ? '...' : ''}
+🔧 方案：${safeSolution}
 
 卡片ID：${recordOutput.match(/id:\s*(\d+)/)?.[1] || '未知'}
 
 ---
 `;
-          cache.ts = 0; // 使缓存失效
-        } catch(e) {
-          console.log('[DEBUG] natural record error:', e.message);
+          cache.ts = 0;
         }
+        // ----- 统计意图 -----
+        else if (hasStatsIntent) {
+          console.log('[DEBUG] natural language stats intent detected:', userMsg.slice(0, 50));
+          const statsCmd = `bash "${scriptsDir}/autoskill-stats" 2>&1`;
+          const statsOutput = execSync(statsCmd, { encoding: 'utf-8', timeout: 10000 });
+          result.prependContext = `📊 经验统计：
+${statsOutput}
+
+---
+`;
+        }
+        // ----- 列表意图 -----
+        else if (hasListIntent) {
+          console.log('[DEBUG] natural language list intent detected:', userMsg.slice(0, 50));
+          const listCmd = `bash "${scriptsDir}/autoskill-list" 2>&1`;
+          const listOutput = execSync(listCmd, { encoding: 'utf-8', timeout: 10000 });
+          result.prependContext = `📋 经验列表：
+${listOutput}
+
+---
+`;
+        }
+        // ----- 搜索意图 -----
+        else if (searchMatch) {
+          const keyword = searchMatch[2].trim();
+          console.log('[DEBUG] natural language search intent detected:', keyword);
+          const searchCmd = `bash "${scriptsDir}/autoskill-search" "${keyword}" 2>&1`;
+          const searchOutput = execSync(searchCmd, { encoding: 'utf-8', timeout: 10000 });
+          result.prependContext = `🔍 搜索"${keyword}"结果：
+${searchOutput}
+
+---
+`;
+        }
+        // ----- 命中意图 -----
+        else if (hasHitIntent) {
+          console.log('[DEBUG] natural language hit intent detected:', userMsg.slice(0, 50));
+          // 获取最新创建的卡片ID
+          const listCmd = `bash "${scriptsDir}/autoskill-list" 2>&1`;
+          const listOutput = execSync(listCmd, { encoding: 'utf-8', timeout: 10000 });
+          const idMatch = listOutput.match(/ID:\s*(\d+)/);
+          if (idMatch) {
+            const cardId = idMatch[1];
+            const hitCmd = `bash "${scriptsDir}/autoskill-hit" ${cardId} 2>&1`;
+            const hitOutput = execSync(hitCmd, { encoding: 'utf-8', timeout: 10000 });
+            result.prependContext = `👍 已标记卡片 #${cardId} 为有用！
+${hitOutput}
+
+---
+`;
+            cache.ts = 0;
+          }
+        }
+      } catch(e) {
+        console.log('[DEBUG] natural language command error:', e.message);
       }
 
       // ========== 工作流模式检测（模型分析） ==========
