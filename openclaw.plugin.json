@@ -2,7 +2,7 @@
   "id": "rocky-auto-skill",
   "name": "Auto Skill",
   "description": "自动经验搜索与记录 — 检测错误自动搜索经验，解决后自动提示记录",
-  "version": "2.7.0",
+  "version": "2.9.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

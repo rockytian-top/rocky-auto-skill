@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-rocky-auto-skill v2.4.1
+rocky-auto-skill v2.1.0
 autoskill-searchx - 混合搜索引擎（BM25 + 向量语义 + 缓存 + 有效性）
 """
 
@@ -16,58 +16,8 @@ from pathlib import Path
 DATA_DIR = os.environ.get('AUTOSKILL_DIR', os.path.expanduser('~/.openclaw/.auto-skill'))
 CARDS_DIR = os.path.join(DATA_DIR, 'cards')
 CACHE_FILE = os.path.join(DATA_DIR, 'embed-cache.json')
-EMBED_URL = os.environ.get('AUTOSKILL_EMBED_URL', '')
-EMBED_MODEL = os.environ.get('AUTOSKILL_EMBED_MODEL', '')
-_AUTO_DETECTED = False
-
-def auto_detect_service():
-    """自动探测 LM Studio 或 Ollama embedding 服务"""
-    global EMBED_URL, EMBED_MODEL, _AUTO_DETECTED
-    if _AUTO_DETECTED:
-        return
-    _AUTO_DETECTED = True
-    if EMBED_URL and EMBED_MODEL:
-        return  # 用户手动设置了（两者都必须有）
-    # 如果只设置了URL或只设置了MODEL，清空另一个并继续自动探测
-    if EMBED_URL or EMBED_MODEL:
-        import sys
-        print("⚠️ AUTOSKILL_EMBED_URL 和 AUTOSKILL_EMBED_MODEL 必须同时设置，忽略手动配置，自动探测中...", file=sys.stderr)
-        EMBED_URL = ''
-        EMBED_MODEL = ''
-
-    # 探测 LM Studio
-    try:
-        req = urllib.request.Request('http://localhost:1234/v1/models')
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            d = json.loads(resp.read())
-            for m in d.get('data', []):
-                name = m.get('id', '')
-                if 'embed' in name.lower() or 'nomic' in name.lower():
-                    EMBED_URL = 'http://localhost:1234/v1/embeddings'
-                    EMBED_MODEL = name
-                    return
-            # 没找到 embedding 模型，用默认
-            EMBED_URL = 'http://localhost:1234/v1/embeddings'
-            EMBED_MODEL = 'text-embedding-nomic-embed-text-v1.5'
-            return
-    except Exception:
-        pass
-
-    # 探测 Ollama
-    try:
-        req = urllib.request.Request('http://localhost:11434/api/tags')
-        with urllib.request.urlopen(req, timeout=2) as resp:
-            d = json.loads(resp.read())
-            for m in d.get('models', []):
-                name = m.get('name', '')
-                if 'embed' in name.lower() or 'nomic' in name.lower() or 'bge' in name.lower():
-                    EMBED_URL = 'http://localhost:11434/v1/embeddings'
-                    EMBED_MODEL = name
-                    return
-            # Ollama 在运行但没 embedding 模型
-            return
-    except Exception:
-        pass
+EMBED_URL = os.environ.get('AUTOSKILL_EMBED_URL', 'http://localhost:1234/v1/embeddings')
+EMBED_MODEL = os.environ.get('AUTOSKILL_EMBED_MODEL', 'text-embedding-nomic-embed-text-v1.5')
 
 # ============ 分词 ============
 
@@ -92,10 +42,7 @@ def save_cache(cache):
         json.dump(cache, f)
 
 def check_vector_available():
-    """检查向量搜索是否可用"""
-    auto_detect_service()
-    if not EMBED_URL or not EMBED_MODEL:
-        return False
+    """检查向量搜索是否可用（LM Studio + embedding 模型）"""
     try:
         req = urllib.request.Request(
             EMBED_URL,
@@ -322,7 +269,7 @@ def hybrid_search(query, top_k=5, bm25_weight=0.3, vector_weight=0.7):
             # 只有 BM25：略微打折
             final = b_score * 0.8
         else:
-            # 只有向量：重度惩罚（embedding对无关内容也可能给高分，需保守；向量分数需≥1.33才能通过0.4阈值，实际不可能）
+            # 只有向量：大幅打折（BM25 完全没命中的不可靠）
             final = v_score * (0.5 if has_any_bm25 else 0.3)
 
         results.append({
@@ -349,7 +296,6 @@ if __name__ == '__main__':
     parser.add_argument('--all', action='store_true', help='查看全部')
     parser.add_argument('--top', type=int, default=5, help='返回数量（默认5）')
     parser.add_argument('--json', action='store_true', help='JSON输出')
-    parser.add_argument('--with-embed', action='store_true', help='JSON输出包含embedding向量')
     parser.add_argument('--rebuild-cache', action='store_true', help='重建缓存')
     args = parser.parse_args()
 
@@ -381,10 +327,6 @@ if __name__ == '__main__':
     results, vector_available = hybrid_search(args.query, top_k=args.top)
 
     if args.json:
-        # JSON 输出时移除 embedding 向量（太大，按需用 --with-embed）
-        if not args.with_embed:
-            for r in results:
-                r.pop('embedding', None)
         print(json.dumps(results, ensure_ascii=False, indent=2))
         sys.exit(0)
 
@@ -403,7 +345,7 @@ if __name__ == '__main__':
         else:
             search_mode = "BM25关键词搜索"
     else:
-        search_mode = "BM25关键词搜索（本地 embedding 服务不可用）"
+        search_mode = "BM25关键词搜索（LM Studio 不可用）"
 
     print(f"🔍 {search_mode} '{args.query}'：")
     print("=" * 40)

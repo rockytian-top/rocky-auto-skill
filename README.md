@@ -1,4 +1,4 @@
-# rocky-auto-skill v2.7.0
+# rocky-auto-skill v2.9.0
 
 自动运维经验闭环系统 | Automated Operations Experience Closed-Loop System
 
@@ -347,5 +347,5 @@ Issues and Pull Requests are welcome!
 
 ---
 
-_版本 Version: 2.7.0_  
-_更新 Update: 2026-04-18_
+_版本 Version: 2.9.0_  
+_更新 Update: 2026-04-19_
