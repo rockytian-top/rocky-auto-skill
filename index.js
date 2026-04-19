@@ -91,68 +91,45 @@ function getModelCredentials(agentModel) {
       }
     }
 
-    // 使用 targetProvider 的配置
+    // 使用 targetProvider 的配置（需要 apiKey 才能直接调用 LLM）
     if (targetProvider && config.models && config.models.providers) {
       const provider = config.models.providers[targetProvider];
-      if (provider) {
+      if (provider && provider.apiKey) {
         const modelId = targetModel || (provider.models && provider.models[0] ? provider.models[0].id : null);
-        if (provider.authHeader) {
-          // OAuth 模式（agent 实际使用）
-          return {
-            baseUrl: provider.baseUrl || 'https://api.minimaxi.com/anthropic',
-            apiKey: process.env.ANTHROPIC_AUTH_TOKEN || '',
-            authHeader: true,
-            apiType: 'anthropic',
-            model: modelId || 'MiniMax-M2.7-highspeed'
-          };
-        }
-        if (provider.apiKey) {
-          return {
-            baseUrl: provider.baseUrl || 'https://api.minimaxi.com/anthropic',
-            apiKey: provider.apiKey,
-            authHeader: false,
-            apiType: (provider.api && provider.api.includes('openai')) ? 'openai' : 'anthropic',
-            model: modelId || 'MiniMax-M2.7-highspeed'
-          };
-        }
+        return {
+          baseUrl: provider.baseUrl || 'https://api.minimaxi.com/anthropic',
+          apiKey: provider.apiKey,
+          authHeader: false,
+          apiType: (provider.api && provider.api.includes('openai')) ? 'openai' : 'anthropic',
+          model: modelId || 'MiniMax-M2.7-highspeed'
+        };
       }
     }
 
-    // 兜底：遍历 providers，优先 authHeader（通常是 agent 实际用的）
+    // 兜底：遍历 providers，找有 apiKey 的
     if (config.models && config.models.providers) {
       for (const [name, p] of Object.entries(config.models.providers)) {
-        if (p.authHeader) {
-          return {
-            baseUrl: p.baseUrl || 'https://api.minimaxi.com/anthropic',
-            apiKey: process.env.ANTHROPIC_AUTH_TOKEN || '',
-            authHeader: true,
-            apiType: 'anthropic',
-            model: p.models && p.models[0] ? p.models[0].id : 'MiniMax-M2.7-highspeed'
-          };
-        }
-      }
-      // 然后找有 apiKey 的
-      for (const [name, p] of Object.entries(config.models.providers)) {
         if (p.apiKey) {
+          const modelId = p.models && p.models[0] ? p.models[0].id : 'glm-5';
           return {
             baseUrl: p.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
             apiKey: p.apiKey,
             authHeader: false,
-            apiType: 'openai',
-            model: p.models && p.models[0] ? p.models[0].id : 'glm-5'
+            apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic',
+            model: modelId
           };
         }
       }
     }
   }
 
-  // 回退到环境变量
+  // 无法获取凭证
   return {
-    baseUrl: process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic',
-    apiKey: process.env.MINIMAX_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || '',
-    authHeader: !!process.env.ANTHROPIC_AUTH_TOKEN,
+    baseUrl: '',
+    apiKey: '',
+    authHeader: false,
     apiType: 'anthropic',
-    model: 'MiniMax-M2.7-highspeed'
+    model: ''
   };
 }
 
@@ -594,7 +571,7 @@ ${contextText}
     // 获取模型凭证
     const creds = getModelCredentials();
     if (!creds.apiKey) {
-      console.log('[DEBUG] LLM enhancement skipped: no API key available');
+      console.log('[DEBUG] LLM enhancement skipped: no API key in openclaw.json config (OAuth not supported)');
       cleanup();
       return null;
     }
