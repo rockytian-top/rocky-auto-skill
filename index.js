@@ -276,9 +276,77 @@ function getRecentExecutedScript() {
   return lastExecutedSkill;
 }
 
+// 从消息历史中查找最近讨论过的 L3 技能
+function findRecentSkillFromMessages(messages, scriptsDir, skillsDir) {
+  if (!messages || messages.length === 0) return null;
+  
+  // 获取 L3 技能列表
+  let l3Skills = [];
+  try {
+    const cardsDir = join(dataDir, 'cards');
+    if (!existsSync(cardsDir)) return null;
+    const files = readdirSync(cardsDir).filter(f => f.endsWith('.yaml'));
+    for (const file of files) {
+      const content = readFileSync(join(cardsDir, file), 'utf-8');
+      const levelM = content.match(/^level:\s*(L\d+)/m);
+      if (levelM && levelM[1] === 'L3') {
+        const idM = content.match(/^id:\s*(\d+)/m);
+        const titleM = content.match(/^title:\s*(.+)/m);
+        const scriptM = content.match(/^skill_script:\s*"?(.+?)"?\s*$/m);
+        if (idM && titleM && scriptM) {
+          const scriptPath = join(skillsDir, scriptM[1]);
+          if (existsSync(scriptPath)) {
+            const scriptContent = readFileSync(scriptPath, 'utf-8');
+            l3Skills.push({
+              id: idM[1],
+              title: titleM[1],
+              scriptPath: scriptPath,
+              scriptContent: scriptContent
+            });
+          }
+        }
+      }
+    }
+  } catch(e) {
+    console.log('[DEBUG] findRecentSkillFromMessages error:', e.message);
+    return null;
+  }
+  
+  if (l3Skills.length === 0) return null;
+  
+  // 从最近的消息中查找提到的技能
+  const recentMsgs = (messages || []).slice(-10);
+  for (const msg of recentMsgs) {
+    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    for (const skill of l3Skills) {
+      // 检查消息是否提到这个技能
+      if (content.includes(skill.title) || skill.title.includes(content.slice(0, 20))) {
+        console.log('[DEBUG] findRecentSkillFromMessages: found', skill.id, skill.title);
+        return {
+          cardId: skill.id,
+          scriptPath: skill.scriptPath,
+          title: skill.title,
+          currentScript: skill.scriptContent,
+          ts: Date.now() - 60000 // 设为1分钟前，在5分钟窗口内
+        };
+      }
+    }
+  }
+  
+  return null;
+}
+
 // ==================== 上下文感知的脚本修改检测（Hermes式 - 模型驱动） ====================
-function detectContextScriptModification(userMsg, messages, recentSkill) {
-  if (!recentSkill) return null;
+function detectContextScriptModification(userMsg, messages, recentSkill, scriptsDir, skillsDir) {
+  // 如果没有直接的 recentSkill，尝试从消息历史中找最近讨论过的 L3 技能
+  if (!recentSkill) {
+    recentSkill = findRecentSkillFromMessages(messages, scriptsDir, skillsDir);
+    if (!recentSkill) {
+      console.log('[DEBUG] detectContextScriptModification: no recent skill found in messages');
+      return null;
+    }
+    console.log('[DEBUG] detectContextScriptModification: found skill from messages:', recentSkill.cardId, recentSkill.title);
+  }
 
   const { cardId, scriptPath, title, currentScript } = recentSkill;
 
@@ -1845,7 +1913,7 @@ ${hitOutput}
       // 只在非回滚意图时检测上下文修改，避免 Python 调用失败影响回滚流程
       let contextModify = null;
       if (!hasRollbackIntent) {
-        contextModify = detectContextScriptModification(userMsg, event.messages || [], lastExecutedSkill);
+        contextModify = detectContextScriptModification(userMsg, event.messages || [], lastExecutedSkill, scriptsDir, skillsDir);
       }
       if (contextModify) {
         console.log('[DEBUG] context script modification detected:', contextModify.reason);
