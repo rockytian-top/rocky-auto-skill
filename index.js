@@ -124,57 +124,100 @@ function getRecentExecutedScript() {
   return lastExecutedSkill;
 }
 
-// ==================== 上下文感知的脚本修改检测（通用网关级别） ====================
+// ==================== 上下文感知的脚本修改检测（Hermes式 - 模型驱动） ====================
 function detectContextScriptModification(userMsg, messages, recentSkill) {
   if (!recentSkill) return null;
 
   const { cardId, scriptPath, title, currentScript } = recentSkill;
-  const msgLower = (userMsg || '').toLowerCase();
 
-  // 检查用户消息是否包含增强/修改意图（通用模式）
-  const enhanceIntentPatterns = [
-    /^还要/,
-    /^应该还要/,
-    /^应该加/,
-    /^不对.*应该/,
-    /^不是.*应该/,
-    /^增加/,
-    /^加上/,
-    /^再加/,
-    /^再多/,
-    /^加一个/,
-    /^加个/,
-    /^补充/,
-    /^改一下/,
-    /^修改/,
-    /^不对/,
-    /^不是这样/,
-    /^说错了/
-  ];
-
-  const hasEnhanceIntent = enhanceIntentPatterns.some(p => p.test(userMsg.trim()));
-
-  // 如果没有明确的增强意图，检查是否在5分钟内执行过技能且消息与技能相关
-  if (!hasEnhanceIntent) {
-    const timeCheck = Date.now() - recentSkill.ts <= 5 * 60 * 1000;
-    if (!timeCheck) return null;
-
-    // 检查消息是否与技能标题相关
-    const titleKeywords = (title || '').replace(/[^\w\u4e00-\u9fa5]/g, ' ').split(/\s+/).filter(Boolean);
-    const isRelated = titleKeywords.some(k => k.length >= 2 && msgLower.includes(k));
-    if (!isRelated) return null;
-
+  // 检查是否在5分钟窗口内
+  if (Date.now() - recentSkill.ts > 5 * 60 * 1000) {
     return null;
   }
 
-  // 提取用户想要的增强内容（去掉命令词，保留核心需求）
-  let enhancement = userMsg
-    .replace(/^(还要|应该还要|应该加|不对.*应该|不是.*应该|增加|加上|再加|再多|加一个|加个|补充|改一下|修改|不对|不是这样|说错了)\s*/i, '')
-    .trim();
+  // 构建对话上下文
+  const recentMessages = (messages || []).slice(-6);
+  const contextText = recentMessages.map(m => {
+    const role = m.role === 'user' ? '用户' : '助手';
+    const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    return `${role}: ${content}`;
+  }).join('\n');
 
-  if (!enhancement || enhancement.length < 1) return null;
+  // 构建LLM prompt，让模型判断是否需要增强
+  const prompt = `你是技能增强判断专家。
 
-  return { cardId, scriptPath, title, currentScript, enhancement };
+当前技能：${title}
+当前脚本：
+${currentScript}
+
+最近对话：
+${contextText}
+
+用户最新消息：${userMsg}
+
+判断：用户是否想要增强这个技能？（比如：添加功能、补充信息、改进输出等）
+
+请仔细分析对话上下文，理解用户的真实意图。
+
+如果用户确实想要增强技能，请提取他们想要什么增强内容（用一句话描述）。
+如果用户不是要增强技能，请回答"不需要增强"。
+
+回答格式：
+- 如果需要增强："增强：<一句话描述用户想要的增强>"
+- 如果不需要："不需要增强"`;
+
+  try {
+    const result = execSync(`python3 -c "
+import requests
+import json
+resp = requests.post(
+    'https://api.minimaxi.com/anthropic/v1/messages',
+    headers={
+        'Content-Type': 'application/json',
+        'x-api-key': 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA',
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    json={
+        'model': 'MiniMax-M2.7',
+        'max_tokens': 100,
+        'messages': [{'role': 'user', 'content': ${JSON.stringify(prompt)}}]
+    },
+    timeout=15
+)
+data = resp.json()
+content = data.get('content', [])
+if content and len(content) > 0:
+    print(content[0].get('text', ''))
+else:
+    print('ERROR')
+" 2>&1`, { encoding: 'utf-8', timeout: 20000 });
+
+    const trimmed = result.trim();
+    console.log('[DEBUG] LLM enhancement check:', trimmed.slice(0, 100));
+
+    if (trimmed === 'ERROR' || trimmed.includes('不需要增强') || trimmed.includes('不需要')) {
+      return null;
+    }
+
+    // 提取增强内容
+    let enhancement = trimmed;
+    if (trimmed.includes('增强：')) {
+      enhancement = trimmed.split('增强：')[1] || trimmed.split('增强:')[1] || '';
+    }
+    enhancement = enhancement.trim();
+
+    if (!enhancement || enhancement.length < 2) {
+      return null;
+    }
+
+    console.log('[DEBUG] LLM detected enhancement intent:', enhancement);
+    return { cardId, scriptPath, title, currentScript, enhancement };
+
+  } catch(e) {
+    console.log('[DEBUG] detectContextScriptModification error:', e.message);
+    return null;
+  }
 }
 
 // ==================== 智能脚本增强（模型驱动） ====================
