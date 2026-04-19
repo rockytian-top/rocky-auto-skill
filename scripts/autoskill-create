@@ -1,0 +1,139 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v1.0.0
+# autoskill-create - 用户直接创建 L3 技能（手动写脚本）
+# =============================================================================
+set -euo pipefail
+
+DATA_DIR="${AUTOSKILL_DIR:-$HOME/.openclaw/.auto-skill}"
+CARDS_DIR="$DATA_DIR/cards"
+SKILLS_DIR="$DATA_DIR/skills"
+
+usage() {
+  cat << 'EOF'
+用法: autoskill-create --title "标题" --tool "工具名" --problem "问题" --solution "方案" --script "脚本路径"
+
+必填:
+  --title     技能标题
+  --tool      关联工具
+  --problem   检测条件描述
+  --solution  解决方案描述
+  --script    修复脚本路径（本地 .sh 文件）
+
+脚本要求:
+  - 返回 0 = 成功
+  - 返回 1 = 检测到问题但修复失败
+  - 返回 2 = 未检测到问题（无需修复）
+EOF
+}
+
+TITLE=""
+TOOL=""
+PROBLEM=""
+SOLUTION=""
+SCRIPT_PATH=""
+TAGS=""
+ROOT_CAUSE=""
+CATEGORY="config"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title)      TITLE="$2"; shift 2 ;;
+    --tool)       TOOL="$2"; shift 2 ;;
+    --problem)    PROBLEM="$2"; shift 2 ;;
+    --solution)   SOLUTION="$2"; shift 2 ;;
+    --script)     SCRIPT_PATH="$2"; shift 2 ;;
+    --tags)       TAGS="$2"; shift 2 ;;
+    --root-cause) ROOT_CAUSE="$2"; shift 2 ;;
+    --category)   CATEGORY="$2"; shift 2 ;;
+    --help|-h)    usage; exit 0 ;;
+    *)            echo "未知参数: $1"; usage; exit 1 ;;
+  esac
+done
+
+if [ -z "$TITLE" ] || [ -z "$TOOL" ] || [ -z "$PROBLEM" ] || [ -z "$SOLUTION" ] || [ -z "$SCRIPT_PATH" ]; then
+  echo "❌ 缺少必填参数！"
+  usage
+  exit 1
+fi
+
+if [ ! -f "$SCRIPT_PATH" ]; then
+  echo "❌ 脚本文件不存在: $SCRIPT_PATH"
+  exit 1
+fi
+
+# 检查脚本可执行
+if [ ! -x "$SCRIPT_PATH" ]; then
+  echo "⚠️ 脚本不可执行，正在添加执行权限..."
+  chmod +x "$SCRIPT_PATH"
+fi
+
+# 生成 ID
+max_id=0
+if ls "$CARDS_DIR"/*.yaml 2>/dev/null | head -1 | grep -q .; then
+  for f in "$CARDS_DIR"/*.yaml; do
+    fid=$(basename "$f" | sed 's/^\([0-9]*\)-.*/\1/')
+    if [ "$fid" -gt "$max_id" ] 2>/dev/null; then
+      max_id=$fid
+    fi
+  done
+fi
+ID=$((max_id + 1))
+
+to_slug() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+SLUG=$(to_slug "$TITLE")
+CARD_FILE="$CARDS_DIR/$(printf '%03d' $ID)-${SLUG}.yaml"
+TODAY=$(date +%Y-%m-%d)
+
+[ -z "$TAGS" ] && TAGS=$(to_slug "$TOOL")
+
+# 复制脚本到 skills 目录
+SKILL_SCRIPT="skills/$(printf '%03d' $ID)-${SLUG}.sh"
+cp "$SCRIPT_PATH" "$DATA_DIR/$SKILL_SCRIPT"
+chmod +x "$DATA_DIR/$SKILL_SCRIPT"
+
+# 写入 YAML
+cat > "$CARD_FILE" << YAMLEOF
+# rocky-auto-skill L3 技能卡片（用户创建）
+id: $(printf '%03d' $ID)
+title: "$TITLE"
+tool: $TOOL
+tags: [$TAGS]
+category: $CATEGORY
+
+level: L3
+hit_count: 0
+source: manual
+skill_status: active
+
+created_at: $TODAY
+last_hit_at: $TODAY
+updated_at: $TODAY
+status: active
+
+problem: |
+$(echo "$PROBLEM" | sed 's/^/  /')
+
+root_cause: |
+$(if [ -n "$ROOT_CAUSE" ]; then echo "$ROOT_CAUSE" | sed 's/^/  /'; else echo "  用户直接创建"; fi)
+
+solution: |
+$(echo "$SOLUTION" | sed 's/^/  /')
+
+commands: |
+  参见技能脚本: $SKILL_SCRIPT
+
+skill_script: $SKILL_SCRIPT
+skill_detect: |
+$(echo "$PROBLEM" | sed 's/^/  /')
+skill_rollback: |
+  手动还原配置
+tool_version: ""
+YAMLEOF
+
+echo "✅ L3 技能卡片已创建: $CARD_FILE"
+echo "   🤖 脚本: $DATA_DIR/$SKILL_SCRIPT"
+echo "   📊 ID: $(printf '%03d' $ID) | Level: 🔴 L3 | Source: manual"

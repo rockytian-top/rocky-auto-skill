@@ -1,0 +1,140 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v2.1.0
+# autoskill-embed - 为卡片生成/更新 embedding 向量
+# =============================================================================
+set -euo pipefail
+
+DATA_DIR="${AUTOSKILL_DIR:-$HOME/.openclaw/.auto-skill}"
+CARDS_DIR="$DATA_DIR/cards"
+EMBED_URL="http://localhost:1234/v1/embeddings"
+EMBED_MODEL="text-embedding-nomic-embed-text-v1.5"
+
+usage() {
+  cat << 'EOF'
+用法: autoskill-embed [id] [--all] [--rebuild]
+
+选项:
+  <id>       为指定卡片生成 embedding
+  --all      为所有缺少 embedding 的卡片生成
+  --rebuild  重建所有卡片的 embedding
+EOF
+}
+
+TARGET=""
+ACTION="single"
+REBUILD=false
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --all)     ACTION="all"; shift ;;
+    --rebuild) REBUILD=true; ACTION="all"; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *)         TARGET="$1"; shift ;;
+  esac
+done
+
+# 检查 LM Studio
+check_lmstudio() {
+  if ! curl -s --max-time 3 "$EMBED_URL" -d '{}' 2>/dev/null | grep -q "error"; then
+    echo "⚠️ LM Studio embedding 服务不可用（localhost:1234）"
+    echo "   请确保 LM Studio 已启动并加载了 embedding 模型"
+    exit 1
+  fi
+}
+
+# 生成 embedding（通过 stdin 管道传文本，避免 shell 注入）
+get_embedding() {
+  local text="$1"
+  echo "$text" | python3 -c "
+import sys, json, urllib.request
+text = sys.stdin.read().strip()
+if not text:
+    sys.exit(1)
+req = urllib.request.Request(
+    '$EMBED_URL',
+    data=json.dumps({'input': text, 'model': '$EMBED_MODEL'}).encode(),
+    headers={'Content-Type': 'application/json'}
+)
+with urllib.request.urlopen(req, timeout=30) as resp:
+    d = json.loads(resp.read())
+    print(json.dumps(d['data'][0]['embedding']))
+" 2>/dev/null
+}
+
+# 为卡片生成 embedding
+embed_card() {
+  local card_file="$1"
+  local card_id
+  card_id=$(grep "^id:" "$card_file" | awk '{print $2}')
+
+  if [ "$REBUILD" = false ]; then
+    if grep -q "^embedding:" "$card_file" 2>/dev/null; then
+      echo "⏭️  [$card_id] 已有 embedding，跳过"
+      return 0
+    fi
+  fi
+
+  # 提取文本内容
+  local title problem solution
+  title=$(grep "^title:" "$card_file" | sed 's/title: *"\?\(.*\)"\?/\1/')
+  problem=$(sed -n '/^problem: |/,/^[a-z_]*:/{/^problem: |/d;/^[a-z_]*:/d;p;}' "$card_file" | tr '\n' ' ' | sed 's/^ *//')
+  solution=$(sed -n '/^solution: |/,/^[a-z_]*:/{/^solution: |/d;/^[a-z_]*:/d;p;}' "$card_file" | tr '\n' ' ' | sed 's/^ *//')
+
+  local embed_text="${title} ${problem} ${solution}"
+
+  echo -n "🔄 [$card_id] 生成 embedding..."
+  local embedding
+  embedding=$(get_embedding "$embed_text")
+
+  if [ -z "$embedding" ]; then
+    echo " ❌ 失败"
+    return 1
+  fi
+
+  # 删除旧 embedding
+  if grep -q "^embedding:" "$card_file" 2>/dev/null; then
+    python3 -c "
+import re, sys
+with open(sys.argv[1]) as f:
+    c = f.read()
+c = re.sub(r'\nembedding: \[.+\]', '', c, count=1)
+with open(sys.argv[1], 'w') as f:
+    f.write(c)
+" "$card_file"
+  fi
+
+  echo "" >> "$card_file"
+  echo "embedding: ${embedding}" >> "$card_file"
+
+  echo " ✅"
+}
+
+check_lmstudio
+
+if [ "$ACTION" = "all" ]; then
+  count=0
+  for f in "$CARDS_DIR"/*.yaml; do
+    [ -f "$f" ] || continue
+    embed_card "$f"
+    count=$((count + 1))
+  done
+  echo ""
+  echo "✅ 处理完成，共 $count 张卡片"
+elif [ -n "$TARGET" ]; then
+  TARGET=$((10#$TARGET))
+  TARGET=$(printf '%03d' "$TARGET")
+
+  for f in "$CARDS_DIR"/*.yaml; do
+    [ -f "$f" ] || continue
+    f_id=$(grep "^id:" "$f" | awk '{print $2}')
+    if [ "$f_id" = "$TARGET" ]; then
+      embed_card "$f"
+      exit 0
+    fi
+  done
+  echo "❌ 找不到卡片 ID: $TARGET"
+  exit 1
+else
+  usage
+fi

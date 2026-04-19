@@ -1,0 +1,75 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v2.8.0
+# autoskill-log - 记录技能执行日志
+# =============================================================================
+set -euo pipefail
+
+DATA_DIR="${AUTOSKILL_DIR:-$HOME/.openclaw/.auto-skill}"
+CARDS_DIR="$DATA_DIR/cards"
+LOG_DIR="$DATA_DIR/logs"
+
+mkdir -p "$LOG_DIR"
+
+usage() {
+  echo "用法: autoskill-log <card_id> <success|failed>"
+}
+
+if [ $# -lt 2 ]; then
+  usage
+  exit 1
+fi
+
+CARD_ID="$1"
+RESULT="$2"
+
+if [ "$RESULT" != "success" ] && [ "$RESULT" != "failed" ]; then
+  echo "结果必须是 'success' 或 'failed'"
+  exit 1
+fi
+
+CARD_FILE=""
+for f in "$CARDS_DIR"/*.yaml; do
+  [ -f "$f" ] || continue
+  f_id=$(grep "^id:" "$f" | awk '{print $2}')
+  if [ "$f_id" = "$CARD_ID" ]; then
+    CARD_FILE="$f"
+    break
+  fi
+done
+
+if [ -z "$CARD_FILE" ]; then
+  echo "找不到卡片: $CARD_ID"
+  exit 1
+fi
+
+TODAY=$(date +%Y-%m-%d)
+
+exec_count=$(grep "^exec_count:" "$CARD_FILE" 2>/dev/null | awk '{print $2}' || echo "0")
+exec_success=$(grep "^exec_success:" "$CARD_FILE" 2>/dev/null | awk '{print $2}' || echo "0")
+
+exec_count=$((exec_count + 1))
+if [ "$RESULT" = "success" ]; then
+  exec_success=$((exec_success + 1))
+fi
+
+# 使用 awk 更新或添加字段
+if grep -q "^exec_count:" "$CARD_FILE"; then
+  sed -i '' "s/^exec_count:.*/exec_count: $exec_count/" "$CARD_FILE"
+else
+  # 在 last_hit_at 后添加
+  sed -i '' "/^last_hit_at:/a exec_count: $exec_count" "$CARD_FILE"
+fi
+
+if grep -q "^exec_success:" "$CARD_FILE"; then
+  sed -i '' "s/^exec_success:.*/exec_success: $exec_success/" "$CARD_FILE"
+else
+  sed -i '' "/^last_hit_at:/a exec_success: $exec_success" "$CARD_FILE"
+fi
+
+sed -i '' "s/^last_hit_at:.*/last_hit_at: $TODAY/" "$CARD_FILE"
+
+LOG_FILE="$LOG_DIR/executions.log"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$CARD_ID] $RESULT (total: $exec_count, success: $exec_success)" >> "$LOG_FILE"
+
+echo "记录完成: [$CARD_ID] $RESULT (总计: $exec_count, 成功: $exec_success)"

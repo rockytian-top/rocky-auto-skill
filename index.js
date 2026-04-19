@@ -1,5 +1,5 @@
 /**
- * rocky-auto-skill Plugin v2.9.0
+ * rocky-auto-skill Plugin v2.9.1
  *
  * 全自动闭环经验系统：
  * 1. 自动检测错误 + 用户问题关键词
@@ -41,6 +41,7 @@ function autoInstall() {
     const files = execSync('ls "' + scriptsDir + '" 2>/dev/null || echo ""').toString().trim().split(/\n/).filter(f => f);
     if (files.length === 0) {
       const srcDirs = [
+        join(__dirname, 'scripts'),  // 插件自带 scripts 目录（用户 clone 后即可用）
         join(stateDir, 'shared-skills', 'rocky-auto-skill', 'scripts'),
         join(stateDir, 'skills', 'rocky-auto-skill', 'scripts')
       ];
@@ -691,9 +692,12 @@ function applySkillUpdate(skillCard, update, sessionDir) {
 function getScriptsDir() {
   const home = process.env.HOME || '/root';
   const stateDir = process.env.OPENCLAW_STATE_DIR || `${home}/.openclaw`;
-  const candidates = [join(stateDir, 'skills', 'rocky-auto-skill', 'scripts')];
+  const candidates = [
+    join(__dirname, 'scripts'),  // 插件自带 scripts 目录
+    join(stateDir, 'skills', 'rocky-auto-skill', 'scripts')
+  ];
   const ws = process.env.OPENCLAW_WORKSPACE;
-  if (ws) candidates.unshift(join(ws, 'skills', 'rocky-auto-skill', 'scripts'));
+  if (ws) candidates.splice(1, 0, join(ws, 'skills', 'rocky-auto-skill', 'scripts'));
   for (const dir of candidates) {
     if (existsSync(join(dir, 'autoskill-search'))) return dir;
   }
