@@ -966,11 +966,7 @@ function getL3SkillsDirect() {
         const scriptName = scriptM[1];
         const scriptPath = join(skillsDir, scriptName);
 
-        // 跳过模板脚本
-        if (existsSync(scriptPath)) {
-          const sc = readFileSync(scriptPath, 'utf-8');
-          if (sc.includes('auto-generated')) continue;
-        }
+        // 不再跳过 auto-generated 脚本，这些是我们创建的自动化技能
 
         if (!existsSync(scriptPath)) continue;
 
