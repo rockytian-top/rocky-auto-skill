@@ -263,6 +263,7 @@ let lastExecutedSkill = null; // { cardId, scriptPath, title, currentScript, ts 
 
 function setLastExecutedSkill(cardId, scriptPath, title, currentScript) {
   lastExecutedSkill = { cardId, scriptPath, title, currentScript, ts: Date.now() };
+  console.log('[DEBUG] setLastExecutedSkill called:', cardId, title, 'expires in 5min');
 }
 
 function getRecentExecutedScript() {
@@ -1795,9 +1796,12 @@ ${hitOutput}
         // ----- 回滚意图 -----
         else if (hasRollbackIntent) {
           console.log('[DEBUG] natural language rollback intent detected:', userMsg.slice(0, 50));
+          console.log('[DEBUG] lastExecutedSkill check:', lastExecutedSkill ? `${lastExecutedSkill.cardId} ${lastExecutedSkill.title}` : 'NULL');
           // 获取当前执行的技能路径（如果有）
           if (lastExecutedSkill && lastExecutedSkill.scriptPath) {
+            console.log('[DEBUG] rollback: calling rollbackScript with path:', lastExecutedSkill.scriptPath);
             const rollbackResult = rollbackScript(lastExecutedSkill.scriptPath);
+            console.log('[DEBUG] rollbackResult:', JSON.stringify(rollbackResult));
             if (rollbackResult.success) {
               result.prependContext = `🔄 ${rollbackResult.message}
 📌 技能：${lastExecutedSkill.title}
@@ -1830,8 +1834,11 @@ ${hitOutput}
 
       // ========== 反馈意图检测：用户说"不对"、"应该还要"等 = 触发脚本优化 ==========
       // ========== 上下文感知的脚本修改（Hermes式） ==========
-      // 检测用户是否在上下文会话中要求修改/增强当前技能
-      const contextModify = detectContextScriptModification(userMsg, event.messages || [], lastExecutedSkill);
+      // 只在非回滚意图时检测上下文修改，避免 Python 调用失败影响回滚流程
+      let contextModify = null;
+      if (!hasRollbackIntent) {
+        contextModify = detectContextScriptModification(userMsg, event.messages || [], lastExecutedSkill);
+      }
       if (contextModify) {
         console.log('[DEBUG] context script modification detected:', contextModify.reason);
         try {
