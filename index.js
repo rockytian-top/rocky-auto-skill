@@ -572,7 +572,7 @@ else:
         creds['baseUrl'] + '/v1/messages',
         headers=creds['headers'],
         json={
-            'model': 'MiniMax-M2.7',
+            'model': 'MiniMax-M2.7-highspeed',
             'max_tokens': 100,
             'messages': [{'role': 'user', 'content': prompt}]
         },
@@ -719,7 +719,7 @@ else:
         creds['baseUrl'] + '/v1/messages',
         headers=creds['headers'],
         json={
-            'model': 'MiniMax-M2.7',
+            'model': 'MiniMax-M2.7-highspeed',
             'max_tokens': 500,
             'messages': [{'role': 'user', 'content': prompt}]
         },
