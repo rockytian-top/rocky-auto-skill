@@ -1,15 +1,18 @@
 /**
- * rocky-auto-skill Plugin v2.10.1
+ * rocky-auto-skill Plugin v3.0
  *
- * 全自动闭环经验系统：
+ * 模型驱动的经验系统（简化版）：
  * 1. 自动检测错误 + 用户问题关键词
- * 2. 自动搜索经验库（L3技能）
- * 3. 自动执行 L3 脚本（成功率≥90%时）
+ * 2. 自动搜索经验库（有脚本的技能）
+ * 3. 模型决定是否执行脚本
  * 4. 自动注入执行结果到 context
- * 5. 自动 hit 计数（脚本成功时）
- * 6. 自动告知 agent 执行结果
- * 7. 模型判断生成/优化/删除技能
- * 8. 每日沉寂扫描，自动清理长期不用的技能
+ * 5. 模型自主决定生成/优化/删除技能
+ * 6. 每日沉寂扫描，自动清理长期不用的技能
+ *
+ * 简化说明（v3.0）：
+ * - 去掉 L1/L2/L3 级别机制
+ * - 去掉 hit_count 晋升规则
+ * - 模型根据上下文自主决定
  */
 
 const { execSync } = require('child_process');
@@ -215,7 +218,7 @@ function autoInstall() {
 }
 
 // ==================== 缓存 ====================
-let cache = { l3Skills: null, templates: null, ts: 0 };
+let cache = { skillsWithScripts: null, templates: null, ts: 0 };
 
 // 执行结果缓存（避免同一错误重复执行脚本，1分钟内不重复执行）
 const CACHE_TTL = 5 * 60 * 1000; // 5分钟
@@ -229,8 +232,8 @@ function isCacheValid() {
 function refreshCache() {
   if (isCacheValid()) { console.log("[DEBUG] cache valid, skip"); return; }
   console.log("[DEBUG] refreshCache rebuilding");
-  cache.l3Skills = getL3SkillsDirect();
-  console.log("[DEBUG] cache.l3Skills:", cache.l3Skills.length, cache.l3Skills.map(s=>s.id+'/'+s.title));
+  cache.skillsWithScripts = getSkillsWithScripts();
+  console.log("[DEBUG] cache.skillsWithScripts:", cache.skillsWithScripts.length, cache.skillsWithScripts.map(s=>s.id+'/'+s.title));
   cache.templates = findTemplateScriptsDirect();
   cache.ts = Date.now();
 }
@@ -248,17 +251,21 @@ function setCachedExec(scriptPath, result) {
 }
 
 // ==================== 模型决策函数 ====================
+// 简化版：模型驱动，不需要硬编码晋升规则
 function askModelDecision(type, ctx) {
-  const rules = {
-    create_card: { decision: (ctx.userMsg||'').length>=10 && /[吗？么什怎如何为什么]|\?|how|what|why|can/i.test(ctx.userMsg||'') ? 'yes' : 'no', title: (ctx.userMsg||'').slice(0,30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g,'') },
-    promote_l2: { decision: (ctx.hit_count||0)>=2 ? 'yes' : 'no' },
-    promote_l3: { decision: (ctx.exec_count||0)>=3 ? 'yes' : 'no' }
-  };
-  return rules[type] || { decision:'no' };
+  // create_card: 仅作为提示，模型最终决定
+  if (type === 'create_card') {
+    const isQuestion = (ctx.userMsg||'').length>=10 && /[吗？么什怎如何为什么]|\?|how|what|why|can/i.test(ctx.userMsg||'');
+    return { 
+      decision: isQuestion ? 'yes' : 'no',
+      title: (ctx.userMsg||'').slice(0,30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g,'')
+    };
+  }
+  return { decision: 'no' };
 }
 
 // ==================== 反馈处理函数 ====================
-// 获取最近执行的 L3 技能
+// 获取最近执行的技能
 let lastExecutedSkill = null; // { cardId, scriptPath, title, currentScript, ts }
 
 function setLastExecutedSkill(cardId, scriptPath, title, currentScript) {
@@ -276,34 +283,32 @@ function getRecentExecutedScript() {
   return lastExecutedSkill;
 }
 
-// 从消息历史中查找最近讨论过的 L3 技能
+// 从消息历史中查找最近讨论过的有脚本的技能
 function findRecentSkillFromMessages(messages, scriptsDir, skillsDir) {
   if (!messages || messages.length === 0) return null;
   
-  // 获取 L3 技能列表
-  let l3Skills = [];
+  // 获取有脚本的技能列表（不再区分L3）
+  let skillsWithScripts = [];
   try {
     const cardsDir = join(dataDir, 'cards');
     if (!existsSync(cardsDir)) return null;
     const files = readdirSync(cardsDir).filter(f => f.endsWith('.yaml'));
     for (const file of files) {
       const content = readFileSync(join(cardsDir, file), 'utf-8');
-      const levelM = content.match(/^level:\s*(L\d+)/m);
-      if (levelM && levelM[1] === 'L3') {
+      // 不再检查 level，只要有 script 就收集
+      const scriptM = content.match(/^skill_script:\s*"?(.+?)"?\s*$/m);
+      if (scriptM) {
         const idM = content.match(/^id:\s*(\d+)/m);
         const titleM = content.match(/^title:\s*(.+)/m);
-        const scriptM = content.match(/^skill_script:\s*"?(.+?)"?\s*$/m);
-        if (idM && titleM && scriptM) {
-          const scriptPath = join(skillsDir, scriptM[1]);
-          if (existsSync(scriptPath)) {
-            const scriptContent = readFileSync(scriptPath, 'utf-8');
-            l3Skills.push({
-              id: idM[1],
-              title: titleM[1],
-              scriptPath: scriptPath,
-              scriptContent: scriptContent
-            });
-          }
+        const scriptPath = join(skillsDir, scriptM[1]);
+        if (existsSync(scriptPath)) {
+          const scriptContent = readFileSync(scriptPath, 'utf-8');
+          skillsWithScripts.push({
+            id: idM ? idM[1] : '???',
+            title: titleM ? titleM[1] : '',
+            scriptPath: scriptPath,
+            scriptContent: scriptContent
+          });
         }
       }
     }
@@ -312,13 +317,13 @@ function findRecentSkillFromMessages(messages, scriptsDir, skillsDir) {
     return null;
   }
   
-  if (l3Skills.length === 0) return null;
+  if (skillsWithScripts.length === 0) return null;
   
   // 从最近的消息中查找提到的技能
   const recentMsgs = (messages || []).slice(-10);
   for (const msg of recentMsgs) {
     const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-    for (const skill of l3Skills) {
+    for (const skill of skillsWithScripts) {
       // 检查消息是否提到这个技能
       if (content.includes(skill.title) || skill.title.includes(content.slice(0, 20))) {
         console.log('[DEBUG] findRecentSkillFromMessages: found', skill.id, skill.title);
@@ -338,7 +343,7 @@ function findRecentSkillFromMessages(messages, scriptsDir, skillsDir) {
 
 // ==================== 上下文感知的脚本修改检测（Hermes式 - 模型驱动） ====================
 function detectContextScriptModification(userMsg, messages, recentSkill, scriptsDir, skillsDir) {
-  // 如果没有直接的 recentSkill，尝试从消息历史中找最近讨论过的 L3 技能
+  // 如果没有直接的 recentSkill，尝试从消息历史中找最近讨论过的技能
   if (!recentSkill) {
     recentSkill = findRecentSkillFromMessages(messages, scriptsDir, skillsDir);
     if (!recentSkill) {
@@ -1306,7 +1311,7 @@ function searchCards(scriptsDir, keyword) {
   }
 }
 
-// ==================== 自动执行 L3 脚本 ====================
+// ==================== 自动执行脚本 ====================
 function autoExecuteScript(scriptPath, cardId, title) {
   // 检查缓存
   const cached = getCachedExec(scriptPath);
@@ -1509,8 +1514,8 @@ function getAllCards() {
   return cards;
 }
 
-// ==================== L3 技能扫描 ====================
-function getL3SkillsDirect() {
+// ==================== 有脚本的技能扫描（简化版：不再区分L3） ====================
+function getSkillsWithScripts() {
   const dataDir = getDataDir();
   const cardsDir = join(dataDir, 'cards');
   const skillsDir = join(dataDir, 'skills');
@@ -1526,9 +1531,8 @@ function getL3SkillsDirect() {
     for (const cardPath of cardFiles) {
       try {
         const content = readFileSync(cardPath, 'utf-8');
-        const levelM = content.match(/^level:\s*(\S+)/m);
-        if (!levelM || levelM[1] !== 'L3') continue;
 
+        // 简化版：不再检查 level，只要有 skill_script 就认为是可执行技能
         const scriptM = content.match(/^skill_script:\s*"?([^"\n]+)"?/m);
         if (!scriptM || !scriptM[1]) continue;
 
@@ -1537,8 +1541,6 @@ function getL3SkillsDirect() {
 
         const scriptName = scriptM[1];
         const scriptPath = join(skillsDir, scriptName);
-
-        // 不再跳过 auto-generated 脚本，这些是我们创建的自动化技能
 
         if (!existsSync(scriptPath)) continue;
 
@@ -1964,17 +1966,17 @@ ${hitOutput}
       });
 
       // 方式1：错误触发
-      const allL3Scripts = [];
+      const matchedScripts = [];
       const triggerInfo = [];
 
       if (errorMsg) {
         const keyword = extractErrorKeywords(errorMsg);
         const searchResults = searchCards(scriptsDir, keyword);
         if (searchResults && searchResults.length > 0) {
-          const l3Scripts = searchResults.filter(r => r.level === 'L3' && r.skill_script);
-          l3Scripts.forEach(r => {
-            if (!allL3Scripts.some(s => s.id === r.id)) {
-              allL3Scripts.push({ ...r, trigger: 'error', keyword });
+          const matchingScripts = searchResults.filter(r => r.skill_script);
+          matchingScripts.forEach(r => {
+            if (!matchedScripts.some(s => s.id === r.id)) {
+              matchedScripts.push({ ...r, trigger: 'error', keyword });
               triggerInfo.push(`🔴 错误触发: "${keyword}"`);
             }
           });
@@ -1994,56 +1996,14 @@ ${hitOutput}
           return titleStr.includes(userLower) || problemStr.includes(userLower);
         });
 
-        // 对匹配到的已有卡片累计 hit（排除刚创建的待补充卡片）
+        // 简化版：不再追踪 hit_count，不再自动晋升
+        // 模型根据上下文自行决定如何处理匹配到的技能
         matchedAll.forEach(c => {
-          if (c.problem !== '待补充') {
-            // L2 卡片的 solution="待补充" 时，模型判断是否晋升
-            if (c.level === 'L2' && c.solution === '待补充' && c.hit_count >= 3) {
-              const modelDecision = askModelDecision('promote_l2', { title: c.title, hit_count: c.hit_count });
-              if (modelDecision.decision === 'yes') {
-                try {
-                  const cardFiles = readdirSync(cardsDir).filter(f => f.startsWith(c.id + '-') || f.startsWith(c.id + '.'));
-                  const cardFile = cardFiles.find(f => f.endsWith('.yaml')) || '';
-                  const base = cardFile.replace(/\.yaml$/, '');
-                  let scriptContent = '#!/bin/bash\n';
-                  scriptContent += `# Auto-generated skill script\n`;
-                  scriptContent += `# Problem: ${c.title}\n`;
-                  const titleLower = (c.title || '').toLowerCase();
-                  if (titleLower.includes('内存') || titleLower.includes('mem')) {
-                    scriptContent += 'echo "ps aux --sort=-%mem | head -11"\n';
-                  } else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
-                    scriptContent += 'echo "ps aux --sort=-%cpu | head -11"\n';
-                  } else if (titleLower.includes('disk') || titleLower.includes('磁盘')) {
-                    scriptContent += 'echo "df -h"\n';
-                  } else if (titleLower.includes('进程') || titleLower.includes('process')) {
-                    scriptContent += 'echo "ps aux | head -20"\n';
-                  } else {
-                    scriptContent += 'echo "echo \'待补充解决方案\'"\n';
-                  }
-                  const scriptPath = join(skillsDir, `${base}.sh`);
-                  writeFileSync(scriptPath, scriptContent, 'utf-8');
-                  chmodSync(scriptPath, 0o755);
-                  const cardPath = join(cardsDir, cardFile);
-                  let cardContent = readFileSync(cardPath, 'utf-8');
-                  cardContent = cardContent.replace(/^skill_script:.*$/m, `skill_script: "${base}.sh"`);
-                  writeFileSync(cardPath, cardContent, 'utf-8');
-                  const promoteCmd = `bash "${scriptsDir}/autoskill-promote" ${c.id} 2>&1`;
-                  execSync(promoteCmd, { encoding: 'utf-8', timeout: 15000 });
-                  cache.ts = 0;
-                } catch(e) {
-                  console.log('[DEBUG] auto-promote failed:', e.message);
-                }
-              }
-            }
-            try {
-              execSync(`bash "${scriptsDir}/autoskill-hit" ${c.id} 2>&1`, { timeout: 5000 });
-              console.log('[DEBUG] hit +1 for card:', c.id, c.title, 'level:', c.level);
-            } catch(e) {}
-          }
+          console.log('[DEBUG] matched skill:', c.id, c.title, 'hasScript:', !!c.skill_script);
         });
 
-        // 从 L3 技能库中匹配（用于自动执行）
-        const matched = cache.l3Skills.filter(s => {
+        // 从有脚本的技能库中匹配
+        const matched = cache.skillsWithScripts.filter(s => {
           const title = (s.title || '').toLowerCase();
           const problem = (s.problem || '').toLowerCase();
           const userLower = userMsg.toLowerCase();
@@ -2055,15 +2015,15 @@ ${hitOutput}
         });
 
         matched.forEach(s => {
-          if (!allL3Scripts.some(s2 => s2.id === s.id)) {
-            allL3Scripts.push({ ...s, trigger: 'user', keyword: userMsg });
+          if (!matchedScripts.some(s2 => s2.id === s.id)) {
+            matchedScripts.push({ ...s, trigger: 'user', keyword: userMsg });
             triggerInfo.push(`🟡 用户消息: "${userMsg.slice(0, 30)}..."`);
           }
         });
 
-        console.log('[DEBUG] L3 match check: matched count:', matched.length, 'allL3Scripts:', allL3Scripts.length, allL3Scripts.map(s=>s.id));
+        console.log('[DEBUG] skill match check: matched count:', matched.length, 'matchedScripts:', matchedScripts.length, matchedScripts.map(s=>s.id));
 
-        // 如果没有匹配到任何技能，自动创建 L1 卡片（去重）
+        // 如果没有匹配到任何技能，模型决定是否创建卡片
         if (matched.length === 0) {
           // 检查是否已存在相同问题的卡片
           const existingCards = getAllCards();
@@ -2091,14 +2051,14 @@ ${hitOutput}
         }
       }
 
-      // 执行 L3 脚本（根据成功率决定）
-      if (allL3Scripts.length > 0) {
+      // 执行匹配的脚本
+      if (matchedScripts.length > 0) {
         const execResults = [];
         const modelCheckSkills = [];  // 成功率不足90%，交给模型
 
-      for (const r of allL3Scripts) {
+      for (const r of matchedScripts) {
           const scriptPath = join(skillsDir, r.skill_script);
-          console.log('[DEBUG] L3 script loop:', r.id, 'scriptPath:', scriptPath, 'exists:', existsSync(scriptPath));
+          console.log('[DEBUG] script loop:', r.id, 'scriptPath:', scriptPath, 'exists:', existsSync(scriptPath));
           if (!existsSync(scriptPath)) continue;
 
           // 跳过模板脚本
@@ -2150,9 +2110,9 @@ ${hitOutput}
         }
 
         // 构建 context
-        console.log('[DEBUG] building prepend: allL3Scripts:', allL3Scripts.length, 'execResults:', execResults.length);
+        console.log('[DEBUG] building prepend: matchedScripts:', matchedScripts.length, 'execResults:', execResults.length);
         const uniqueTriggers = [...new Set(triggerInfo)].slice(0, 3);
-        let prepend = `🔍 auto-skill 检测到 ${allL3Scripts.length} 条相关经验:
+        let prepend = `🔍 auto-skill 检测到 ${matchedScripts.length} 条相关经验:
 `;
         prepend += uniqueTriggers.join('\n') + '\n\n';
 
