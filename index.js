@@ -96,6 +96,100 @@ function setCachedExec(scriptPath, result) {
   execCache.set(scriptPath, { result, ts: Date.now() });
 }
 
+// ==================== 模型决策函数 ====================
+// 智能决策：替代固定规则，由模型判断是否创建/升级知识卡
+function askModelDecision(decisionType, context) {
+  // decisionType: 'create_card' | 'promote_l2' | 'promote_l3' | 'create_skill'
+  // context: { userMsg, card, hit_count, ... }
+
+  try {
+    // 构建决策 prompt
+    const prompts = {
+      create_card: `用户问题："${context.userMsg}"
+这个问题值得记录为知识卡吗？
+判断标准：
+1. 问题是否有通用性（别人也可能遇到）？
+2. 解决方案是否有价值？
+3. 问题是否清晰可回答？
+
+请返回JSON格式：{"decision": "yes|no", "reason": "原因", "title": "知识卡标题"}`,
+
+      promote_l2: `知识卡信息：
+- 标题：${context.title}
+- 问题：${context.problem}
+- 被命中次数：${context.hit_count}
+
+这个知识卡是否应该从L1晋升到L2（创建解决方案）？
+判断标准：
+1. 这个问题是否经常被问到？
+2. 是否有明确的解决方案？
+
+请返回JSON格式：{"decision": "yes|no", "reason": "原因", "solution": "解决方案描述"}`,
+
+      promote_l3: `知识卡信息：
+- 标题：${context.title}
+- 问题：${context.problem}
+- 解决方案：${context.solution}
+
+这个知识卡是否应该从L2晋升到L3（创建自动化技能）？
+判断标准：
+1. 解决方案是否可以自动化成脚本？
+2. 执行频率是否足够高？
+
+请返回JSON格式：{"decision": "yes|no", "reason": "原因", "script_type": "bash|python|other"}`
+    };
+
+    const prompt = prompts[decisionType] || prompts.create_card;
+    console.log(`[DEBUG] askModelDecision: ${decisionType}`, JSON.stringify(context).slice(0, 100));
+
+    // 使用简单的启发式决策（临时方案，后续接入真实LLM）
+    // 真实实现：通过 fetch 调用本地网关的 LLM API
+    const result = simpleHeuristicDecision(decisionType, context);
+    console.log(`[DEBUG] model decision:`, JSON.stringify(result).slice(0, 100));
+    return result;
+  } catch(e) {
+    console.log('[DEBUG] askModelDecision error:', e.message);
+    return { decision: 'no', reason: 'error', title: '' };
+  }
+}
+
+// 简单启发式决策（替代固定规则）
+function simpleHeuristicDecision(decisionType, context) {
+  switch(decisionType) {
+    case 'create_card': {
+      const msg = context.userMsg || '';
+      // 问题长度适中（10-100字）+ 包含疑问词 = 值得记录
+      const isWorthRecording = msg.length >= 10 && msg.length <= 200 &&
+        /[吗？么什怎如何为什么]|\?|how|what|why|can/i.test(msg);
+      return {
+        decision: isWorthRecording ? 'yes' : 'no',
+        reason: isWorthRecording ? '问题清晰，有通用性' : '问题太短或太随意',
+        title: msg.slice(0, 30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '')
+      };
+    }
+    case 'promote_l2': {
+      const hitCount = context.hit_count || 0;
+      // hit >= 2 就可以考虑晋升（模型判断更准确）
+      return {
+        decision: hitCount >= 2 ? 'yes' : 'no',
+        reason: hitCount >= 2 ? '被多次引用' : '引用次数不足',
+        solution: '根据问题内容生成解决方案'
+      };
+    }
+    case 'promote_l3': {
+      const execCount = context.exec_count || 0;
+      // 执行次数 >= 3 且成功率高 = 可以自动化
+      return {
+        decision: execCount >= 3 ? 'yes' : 'no',
+        reason: execCount >= 3 ? '执行稳定，可以自动化' : '执行次数不足',
+        script_type: 'bash'
+      };
+    }
+    default:
+      return { decision: 'no', reason: 'unknown type', title: '' };
+  }
+}
+
 // ==================== 工作流模式识别（模型判断） ====================
 const WORKFLOW_DIR = join(process.env.OPENCLAW_STATE_DIR || (process.env.HOME || '/root') + '/.openclaw', '.auto-skill', 'workflows');
 const WORKFLOW_SEQ_TTL = 30 * 60 * 1000; // 30分钟会话窗口
@@ -1323,12 +1417,20 @@ ${hitOutput}
         matchedAll.forEach(c => {
           if (c.problem !== '待补充') {
             // L2 卡片的 solution="待补充" 时，自动 promote 生成 solution 和 script
-            if (c.level === 'L2' && c.solution === '待补充' && c.hit_count >= 5) {
-              try {
-                // 动态获取卡片文件名（从路径提取）
-                const cardFiles = readdirSync(cardsDir).filter(f => f.startsWith(c.id + '-') || f.startsWith(c.id + '.'));
-                const cardFile = cardFiles.find(f => f.endsWith('.yaml')) || '';
-                const base = cardFile.replace(/\.yaml$/, '');
+            // 使用模型判断是否应该晋升
+            if (c.level === 'L2' && c.solution === '待补充' && c.hit_count >= 3) {
+              // 模型判断：是否创建技能脚本
+              const modelDecision = askModelDecision('promote_l2', {
+                card_id: c.id,
+                title: c.title,
+                problem: c.problem,
+                hit_count: c.hit_count
+              });
+              if (modelDecision.decision === 'yes') {
+                try {
+                  const cardFiles = readdirSync(cardsDir).filter(f => f.startsWith(c.id + '-') || f.startsWith(c.id + '.'));
+                  const cardFile = cardFiles.find(f => f.endsWith('.yaml')) || '';
+                  const base = cardFile.replace(/\.yaml$/, '');
 
                 // 自动创建脚本文件（基于工具类型和问题关键词）
                 let scriptContent = '#!/bin/bash\n';
@@ -1398,7 +1500,7 @@ ${hitOutput}
 
         console.log('[DEBUG] L3 match check: matched count:', matched.length, 'allL3Scripts:', allL3Scripts.length, allL3Scripts.map(s=>s.id));
 
-        // 如果没有匹配到任何技能，自动创建 L1 卡片（去重）
+        // 如果没有匹配到任何技能，模型判断是否创建 L1 卡片
         if (matched.length === 0) {
           // 检查是否已存在相同问题的卡片
           const existingCards = getAllCards();
@@ -1410,15 +1512,20 @@ ${hitOutput}
           if (alreadyExists) {
             console.log('[DEBUG] card already exists, skip auto-create');
           } else {
-            try {
-              const safeTitle = userMsg.slice(0, 30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '-');
-              const recordCmd = `bash "${scriptsDir}/autoskill-record" --title "${safeTitle}" --tool "bash" --problem "${userMsg}" --solution "待补充" 2>&1`;
-              const recordOutput = execSync(recordCmd, { encoding: 'utf-8', timeout: 10000 });
-              console.log('[DEBUG] auto-created card:', recordOutput.slice(0, 100));
-              // 使缓存失效，下次会重新加载
-              cache.ts = 0;
-            } catch(e) {
-              console.log('[DEBUG] auto-create failed:', e.message);
+            // 模型判断：是否值得创建知识卡
+            const decision = askModelDecision('create_card', { userMsg });
+            if (decision.decision === 'yes') {
+              try {
+                const safeTitle = (decision.title || userMsg.slice(0, 30)).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '-');
+                const recordCmd = `bash "${scriptsDir}/autoskill-record" --title "${safeTitle}" --tool "ai" --problem "${userMsg}" --solution "待补充" 2>&1`;
+                const recordOutput = execSync(recordCmd, { encoding: 'utf-8', timeout: 10000 });
+                console.log('[DEBUG] model-driven auto-created card:', decision.reason, recordOutput.slice(0, 100));
+                cache.ts = 0; // 使缓存失效
+              } catch(e) {
+                console.log('[DEBUG] auto-create failed:', e.message);
+              }
+            } else {
+              console.log('[DEBUG] model decided not to create card:', decision.reason);
             }
           }
         }
