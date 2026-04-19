@@ -124,6 +124,132 @@ function getRecentExecutedScript() {
   return lastExecutedSkill;
 }
 
+// ==================== 上下文感知的脚本修改检测（Hermes式） ====================
+function detectContextScriptModification(userMsg, messages, recentSkill) {
+  if (!recentSkill) return null;
+
+  const { cardId, scriptPath, title, currentScript } = recentSkill;
+  const titleLower = (title || '').toLowerCase();
+  const msgLower = (userMsg || '').toLowerCase();
+
+  // 检查用户消息是否包含增强意图
+  const enhancePatterns = [
+    /还要|再加|再增加|还要显示|还要加|应该加|应该还有|也要|加上/,
+    /不对|不是|应该|改一下|修改|更新/,
+    /增加|增强|加一个|加个|多一个/
+  ];
+  const hasEnhanceIntent = enhancePatterns.some(p => p.test(userMsg));
+
+  if (!hasEnhanceIntent) return null;
+
+  // 检查消息是否与当前技能相关（通过最近的对话上下文判断）
+  // 提取用户消息中的关键实体
+  let entity = '';
+  if (titleLower.includes('内存') || titleLower.includes('mem')) {
+    entity = '内存';
+  } else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
+    entity = 'cpu';
+  } else if (titleLower.includes('磁盘') || titleLower.includes('disk')) {
+    entity = '磁盘';
+  } else if (titleLower.includes('进程') || titleLower.includes('process')) {
+    entity = '进程';
+  }
+
+  // 从用户消息中提取想要的增强内容
+  let enhancement = '';
+  if (/swap|交换/.test(msgLower)) enhancement = '添加swap使用情况';
+  else if (/详细|完整|更多/.test(msgLower)) enhancement = '添加更详细的信息';
+  else if (/cpu|处理器/.test(msgLower)) enhancement = '添加CPU信息';
+  else if (/磁盘|硬盘|disk/.test(msgLower)) enhancement = '添加磁盘使用情况';
+  else if (/进程|process/.test(msgLower)) enhancement = '添加进程列表';
+  else if (/内存|mem/.test(msgLower)) enhancement = '添加内存详细信息';
+  else if (/网络|net/.test(msgLower)) enhancement = '添加网络状态';
+  else if (/端口|port/.test(msgLower)) enhancement = '添加端口占用';
+  else if (/日志|log/.test(msgLower)) enhancement = '添加日志查看';
+  else if (/服务|service/.test(msgLower)) enhancement = '添加服务状态';
+
+  if (!enhancement) return null;
+
+  // 检查消息是否在上下文会话中（与技能相关）
+  // 通过检查之前的对话是否包含相关关键词
+  const contextRelevant = messages.some(m => {
+    const content = (m.content || '').toLowerCase();
+    return content.includes(entity) || content.includes(titleLower.slice(0, 5));
+  });
+
+  if (!contextRelevant && messages.length > 2) {
+    // 如果消息与上下文完全不相关，可能不是反馈
+    return null;
+  }
+
+  return { cardId, scriptPath, title, currentScript, enhancement };
+}
+
+function applyScriptEnhancement(title, currentScript, enhancement) {
+  const titleLower = (title || '').toLowerCase();
+  let newScript = currentScript;
+
+  // 内存技能增强
+  if (titleLower.includes('内存') || titleLower.includes('mem')) {
+    if (enhancement.includes('swap') || enhancement.includes('交换')) {
+      if (!currentScript.includes('swapon')) {
+        newScript = currentScript.replace(
+          /ps aux --sort=-%mem \| head -\d*/,
+          'free -h && echo "---" && swapon --show && echo "---" && ps aux --sort=-%mem | head -11'
+        );
+      }
+    }
+    if (enhancement.includes('详细')) {
+      if (!currentScript.includes('top')) {
+        newScript = currentScript.replace(
+          /ps aux --sort=-%mem \| head -\d*/,
+          'echo "=== 内存概览 ===" && free -h && echo "=== Swap ===" && swapon --show && echo "=== 进程 Top15 ===" && top -b -n 1 | head -20'
+        );
+      }
+    }
+  }
+  // CPU技能增强
+  else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
+    if (enhancement.includes('CPU') || enhancement.includes('信息')) {
+      if (!currentScript.includes('lscpu')) {
+        newScript = currentScript.replace(
+          /ps aux --sort=-%cpu \| head -\d*/,
+          'lscpu && echo "---" && ps aux --sort=-%cpu | head -11'
+        );
+      }
+    }
+  }
+  // 磁盘技能增强
+  else if (titleLower.includes('磁盘') || titleLower.includes('disk')) {
+    if (enhancement.includes('磁盘') || enhancement.includes('使用')) {
+      if (!currentScript.includes('du -sh')) {
+        newScript = currentScript.replace(
+          /df -h/,
+          'df -h && echo "---" && du -sh /* 2>/dev/null | sort -hr | head -10'
+        );
+      }
+    }
+  }
+  // 进程技能增强
+  else if (titleLower.includes('进程') || titleLower.includes('process')) {
+    if (enhancement.includes('进程') || enhancement.includes('列表')) {
+      if (!currentScript.includes('pstree')) {
+        newScript = currentScript.replace(
+          /ps aux/,
+          'ps aux && echo "---" && pstree -p'
+        );
+      }
+    }
+  }
+
+  if (newScript === currentScript) {
+    console.log('[DEBUG] applyScriptEnhancement: no change applied');
+    return currentScript;
+  }
+
+  return newScript;
+}
+
 // 根据反馈生成新脚本
 function generateScriptFromFeedback(feedback, title, currentScript) {
   const titleLower = (title || '').toLowerCase();
@@ -1335,29 +1461,8 @@ module.exports = {
       const hasHitIntent = hitIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
 
       // ---------- 反馈意图 ----------
-      const feedbackIntentPatterns = [
-        /^\s*不对/,
-        /^\s*不对，/,
-        /^\s*不对，应该/,
-        /^\s*应该还要/,
-        /^\s*应该加/,
-        /^\s*还要加/,
-        /^\s*不对，还要/,
-        /^\s*修改一下/,
-        /^\s*改一下/,
-        /^\s*改一下脚本/,
-        /^\s*更新脚本/,
-        /^\s*脚本不对/,
-        /^\s*结果不对/,
-        /^\s*回答不对/,
-        /^\s*不是这样/,
-        /^\s*不是的/,
-        /^\s*说错了/,
-        /^\s*不对，是/,
-        /^\s*重新/,
-        /^\s*再来一次/
-      ];
-      const hasFeedbackIntent = feedbackIntentPatterns.some(p => p.test(userMsg));
+      // 上下文相关的脚本修改（无需明确命令，根据对话上下文隐式判断）
+      // 只要消息与当前执行的技能相关，且包含"增加"、"加"、"还要"等词，就触发脚本修改
 
       // ========== 执行自然语言命令 ==========
       try {
@@ -1461,42 +1566,33 @@ ${hitOutput}
       }
 
       // ========== 反馈意图检测：用户说"不对"、"应该还要"等 = 触发脚本优化 ==========
-      if (hasFeedbackIntent) {
-        console.log('[DEBUG] feedback intent detected:', userMsg.slice(0, 50));
+      // ========== 上下文感知的脚本修改（Hermes式） ==========
+      // 检测用户是否在上下文会话中要求修改/增强当前技能
+      const contextModify = detectContextScriptModification(userMsg, event.messages || [], lastExecutedSkill);
+      if (contextModify) {
+        console.log('[DEBUG] context script modification detected:', contextModify.reason);
         try {
-          // 从上下文找出最近执行的 L3 技能
-          // 反馈通常是紧跟在技能执行之后，所以找最近的 L3 技能 ID
-          const recentL3Script = getRecentExecutedScript();
-          if (recentL3Script) {
-            const { cardId, scriptPath, title, currentScript } = recentL3Script;
-            console.log('[DEBUG] feedback for skill:', cardId, title);
+          const { cardId, scriptPath, title, currentScript, enhancement } = contextModify;
 
-            // 记录执行失败（帮助后续分析）
-            try {
-              execSync(`bash "${scriptsDir}/autoskill-log" ${cardId} failed`, { timeout: 5000 });
-            } catch(e) {}
+          // 生成增强后的脚本
+          const newScript = applyScriptEnhancement(title, currentScript, enhancement);
+          if (newScript && newScript !== currentScript) {
+            writeFileSync(scriptPath, newScript, 'utf-8');
+            chmodSync(scriptPath, 0o755);
+            console.log('[DEBUG] context script updated for card:', cardId, 'enhancement:', enhancement);
 
-            // 根据反馈生成新脚本
-            const newScript = generateScriptFromFeedback(userMsg, title, currentScript);
-            if (newScript && newScript !== currentScript) {
-              // 更新脚本文件
-              writeFileSync(scriptPath, newScript, 'utf-8');
-              chmodSync(scriptPath, 0o755);
-              console.log('[DEBUG] script updated for card:', cardId);
-
-              result.prependContext = `🔧 已根据反馈优化技能脚本：
+            result.prependContext = `🔧 已根据上下文自动增强技能脚本：
 📌 技能：${title}
-💬 你的反馈：${userMsg}
+💡 增强：${enhancement}
 
-新脚本已更新，下次执行会使用新脚本~
+脚本已更新，下次执行会使用增强版本~
 
 ---
 `;
-              cache.ts = 0;
-            }
+            cache.ts = 0;
           }
         } catch(e) {
-          console.log('[DEBUG] feedback processing error:', e.message);
+          console.log('[DEBUG] context modification error:', e.message);
         }
       }
 
