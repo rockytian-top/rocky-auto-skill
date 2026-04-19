@@ -77,22 +77,58 @@ function getModelCredentials(agentModel) {
     targetModel = parts[1];
   }
 
-  if (config) {
-    // 尝试从 agents 配置中找到实际使用的 model
-    if (!targetProvider && config.agents && config.agents.list) {
-      // 遍历 agents，找有 model 且包含 / 的
-      for (const agent of config.agents.list) {
-        if (agent.model && agent.model.includes('/')) {
-          const parts = agent.model.split('/');
-          targetProvider = parts[0];
-          targetModel = parts[1];
-          break;
-        }
+  // 尝试从 agents 配置中找到实际使用的 model
+  if (!targetProvider && config && config.agents && config.agents.list) {
+    for (const agent of config.agents.list) {
+      if (agent.model && agent.model.includes('/')) {
+        const parts = agent.model.split('/');
+        targetProvider = parts[0];
+        targetModel = parts[1];
+        break;
       }
     }
+  }
 
-    // 使用 targetProvider 的配置（需要 apiKey 才能直接调用 LLM）
-    if (targetProvider && config.models && config.models.providers) {
+  // 优先尝试环境变量（OAuth token，用户启动网关时配置）
+  // 这些是最常用的 LLM API 环境变量
+  const envVars = [
+    'ANTHROPIC_AUTH_TOKEN',  // minimax OAuth
+    'OPENAI_API_KEY',
+    'API_KEY',
+    'MINIMAX_API_KEY'
+  ];
+  for (const varName of envVars) {
+    const token = process.env[varName];
+    if (token && token.length > 10) {
+      // 确定 API 类型
+      let apiType = 'anthropic';
+      let baseUrl = 'https://api.minimaxi.com/anthropic';
+      if (varName === 'OPENAI_API_KEY' || varName === 'API_KEY') {
+        apiType = 'openai';
+        baseUrl = 'https://api.openai.com/v1';
+      }
+      // 如果有 provider 配置，使用其 baseUrl
+      if (targetProvider && config && config.models && config.models.providers) {
+        const provider = config.models.providers[targetProvider];
+        if (provider && provider.baseUrl) {
+          baseUrl = provider.baseUrl;
+        }
+      }
+      const modelId = targetModel || 'MiniMax-M2.7-highspeed';
+      return {
+        baseUrl,
+        apiKey: token,
+        authHeader: true,
+        apiType,
+        model: modelId
+      };
+    }
+  }
+
+  // 回退：从 openclaw.json 读取
+  if (config && config.models && config.models.providers) {
+    // 使用 targetProvider 的配置
+    if (targetProvider) {
       const provider = config.models.providers[targetProvider];
       if (provider && provider.apiKey) {
         const modelId = targetModel || (provider.models && provider.models[0] ? provider.models[0].id : null);
@@ -105,20 +141,17 @@ function getModelCredentials(agentModel) {
         };
       }
     }
-
     // 兜底：遍历 providers，找有 apiKey 的
-    if (config.models && config.models.providers) {
-      for (const [name, p] of Object.entries(config.models.providers)) {
-        if (p.apiKey) {
-          const modelId = p.models && p.models[0] ? p.models[0].id : 'glm-5';
-          return {
-            baseUrl: p.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
-            apiKey: p.apiKey,
-            authHeader: false,
-            apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic',
-            model: modelId
-          };
-        }
+    for (const [name, p] of Object.entries(config.models.providers)) {
+      if (p.apiKey) {
+        const modelId = p.models && p.models[0] ? p.models[0].id : 'glm-5';
+        return {
+          baseUrl: p.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
+          apiKey: p.apiKey,
+          authHeader: false,
+          apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic',
+          model: modelId
+        };
       }
     }
   }
@@ -571,7 +604,7 @@ ${contextText}
     // 获取模型凭证
     const creds = getModelCredentials();
     if (!creds.apiKey) {
-      console.log('[DEBUG] LLM enhancement skipped: no API key in openclaw.json config (OAuth not supported)');
+      console.log('[DEBUG] LLM enhancement skipped: no API key available');
       cleanup();
       return null;
     }
