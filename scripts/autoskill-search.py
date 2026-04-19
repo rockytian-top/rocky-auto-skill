@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 rocky-auto-skill v2.1.0
-autoskill-searchx - 混合搜索引擎（BM25 + 向量语义 + 缓存 + 有效性）
+autoskill-search - 混合搜索引擎（BM25 + 向量语义 + 缓存 + 有效性）
 """
 
 import json
@@ -13,7 +13,15 @@ import urllib.request
 from collections import Counter
 from pathlib import Path
 
-DATA_DIR = os.environ.get('AUTOSKILL_DIR', os.path.expanduser('~/.openclaw/.auto-skill'))
+# 根据 OPENCLAW_STATE_DIR 自动选择数据目录（与 index.js 一致）
+OPENCLAW_STATE_DIR = os.environ.get('OPENCLAW_STATE_DIR', '')
+HOME = os.path.expanduser('~')
+if os.environ.get('AUTOSKILL_DIR'):
+    DATA_DIR = os.environ.get('AUTOSKILL_DIR')
+elif OPENCLAW_STATE_DIR:
+    DATA_DIR = os.path.join(OPENCLAW_STATE_DIR, '.auto-skill')
+else:
+    DATA_DIR = os.path.join(HOME, '.openclaw', '.auto-skill')
 CARDS_DIR = os.path.join(DATA_DIR, 'cards')
 CACHE_FILE = os.path.join(DATA_DIR, 'embed-cache.json')
 EMBED_URL = os.environ.get('AUTOSKILL_EMBED_URL', 'http://localhost:1234/v1/embeddings')

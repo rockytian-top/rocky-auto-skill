@@ -1,20 +1,236 @@
 /**
- * rocky-auto-skill Plugin v2.7.0
+ * rocky-auto-skill Plugin v3.0
  *
- * 全自动闭环经验系统：
+ * 模型驱动的经验系统（简化版）：
  * 1. 自动检测错误 + 用户问题关键词
- * 2. 自动搜索经验库（L3技能）
- * 3. 自动执行 L3 脚本（成功率≥90%时）
+ * 2. 自动搜索经验库（有脚本的技能）
+ * 3. 模型决定是否执行脚本
  * 4. 自动注入执行结果到 context
- * 5. 自动 hit 计数（脚本成功时）
- * 6. 自动告知 agent 执行结果
- * 7. 成功率低于90%时交给模型判断
- * 8. 模板脚本优化提示（限频：每天最多3次）
+ * 5. 模型自主决定生成/优化/删除技能
+ * 6. 每日沉寂扫描，自动清理长期不用的技能
+ *
+ * 简化说明（v3.0）：
+ * - 去掉 L1/L2/L3 级别机制
+ * - 去掉 hit_count 晋升规则
+ * - 模型根据上下文自主决定
  */
 
 const { execSync } = require('child_process');
-const { existsSync, readFileSync, statSync, writeFileSync } = require('fs');
+const { existsSync, readFileSync, readdirSync, statSync, writeFileSync, chmodSync, copyFileSync, unlinkSync } = require('fs');
 const { join } = require('path');
+
+// ==================== 网关配置读取 ====================
+function getGatewayConfig() {
+  try {
+    const configPath = process.env.OPENCLAW_STATE_DIR 
+      ? join(process.env.OPENCLAW_STATE_DIR, 'openclaw.json')
+      : join(require('os').homedir(), '.openclaw-gateway2', 'openclaw.json');
+    if (existsSync(configPath)) {
+      return JSON.parse(readFileSync(configPath, 'utf-8'));
+    }
+  } catch(e) {}
+  return null;
+}
+
+function getModelCredentials() {
+  // 优先使用环境变量中的OAuth token（网关正常运行minimax的关键）
+  const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
+  if (authToken) {
+    return {
+      baseUrl: process.env.ANTHROPIC_BASE_URL || 'https://api.minimaxi.com/anthropic',
+      apiKey: authToken,
+      authHeader: true,  // 使用 Bearer token
+      apiType: 'anthropic'
+    };
+  }
+
+  // 从网关配置读取模型凭证
+  const config = getGatewayConfig();
+  if (config && config.models && config.models.providers) {
+    // 优先使用有完整配置的 provider（baseUrl + apiKey）
+    const zai = config.models.providers['zai'];
+    if (zai && zai.apiKey) {
+      return {
+        baseUrl: zai.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
+        apiKey: zai.apiKey,
+        authHeader: false,
+        apiType: 'openai'
+      };
+    }
+    // minimax-portal 或其他 provider
+    const providerNames = Object.keys(config.models.providers);
+    for (const name of providerNames) {
+      const p = config.models.providers[name];
+      if (p && (p.apiKey || p.authHeader)) {
+        return {
+          baseUrl: p.baseUrl || 'https://api.minimaxi.com/anthropic',
+          apiKey: p.apiKey || '',
+          authHeader: p.authHeader || false,
+          apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic'
+        };
+      }
+    }
+  }
+
+  // 回退到环境变量
+  return {
+    baseUrl: process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic',
+    apiKey: process.env.MINIMAX_API_KEY || '',
+    authHeader: false,
+    apiType: 'anthropic'
+  };
+}
+
+// ==================== 脚本版本备份 ====================
+const MAX_BACKUP_VERSIONS = 2;
+
+/**
+ * 备份当前脚本版本
+ * @param {string} scriptPath - 脚本完整路径
+ * @returns {boolean} - 是否成功
+ */
+function backupScript(scriptPath) {
+  try {
+    if (!existsSync(scriptPath)) return false;
+    
+    const stats = statSync(scriptPath);
+    const mtime = stats.mtime.toISOString().slice(0, 10);
+    
+    // 获取现有版本信息
+    const metaPath = scriptPath + '.versions.json';
+    let versions = [];
+    if (existsSync(metaPath)) {
+      try {
+        versions = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      } catch(e) { versions = []; }
+    }
+    
+    // 添加当前版本记录（如果内容有变化）
+    const currentContent = readFileSync(scriptPath, 'utf-8');
+    const lastVersion = versions[0];
+    if (!lastVersion || lastVersion.content !== currentContent) {
+      versions.unshift({
+        version: (versions.length + 1),
+        date: mtime,
+        content: currentContent,
+        size: currentContent.length
+      });
+    }
+    
+    // 只保留最近MAX_BACKUP_VERSIONS个版本
+    versions = versions.slice(0, MAX_BACKUP_VERSIONS);
+    
+    // 保存版本元数据
+    const metaToSave = versions.map(v => ({ version: v.version, date: v.date, size: v.size }));
+    writeFileSync(metaPath, JSON.stringify(metaToSave, null, 2), 'utf-8');
+    
+    // 备份文件：v1, v2, v3, v4, v5
+    for (let i = 0; i < versions.length; i++) {
+      const backupPath = scriptPath + '.v' + (i + 1);
+      if (!existsSync(backupPath) || readFileSync(backupPath, 'utf-8') !== versions[i].content) {
+        writeFileSync(backupPath, versions[i].content, 'utf-8');
+      }
+    }
+    
+    // 删除多余的备份文件
+    for (let i = versions.length + 1; i <= MAX_BACKUP_VERSIONS; i++) {
+      const backupPath = scriptPath + '.v' + i;
+      if (existsSync(backupPath)) {
+        try { unlinkSync(backupPath); } catch(e) {}
+      }
+    }
+    
+    console.log('[DEBUG] backupScript: backed up', scriptPath, 'versions:', versions.length);
+    return true;
+  } catch(e) {
+    console.log('[DEBUG] backupScript error:', e.message);
+    return false;
+  }
+}
+
+/**
+ * 回滚到上一个版本
+ * @param {string} scriptPath - 脚本完整路径
+ * @returns {object} - {success, content, message}
+ */
+function rollbackScript(scriptPath) {
+  try {
+    const metaPath = scriptPath + '.versions.json';
+    if (!existsSync(metaPath)) {
+      return { success: false, message: '没有可用的备份版本' };
+    }
+    
+    let versions = [];
+    try {
+      versions = JSON.parse(readFileSync(metaPath, 'utf-8'));
+    } catch(e) {
+      return { success: false, message: '备份元数据损坏' };
+    }
+    
+    if (versions.length < 2) {
+      return { success: false, message: '没有足够的备份版本可供回滚' };
+    }
+    
+    // 使用倒数第二个版本（当前是第一个）
+    const prevVersion = versions[1];
+    const backupPath = scriptPath + '.v2';
+    
+    if (!existsSync(backupPath)) {
+      return { success: false, message: '备份文件丢失' };
+    }
+    
+    const prevContent = readFileSync(backupPath, 'utf-8');
+    
+    // 先备份当前版本
+    backupScript(scriptPath);
+    
+    // 恢复为上一个版本
+    writeFileSync(scriptPath, prevContent, 'utf-8');
+    chmodSync(scriptPath, 0o755);
+    
+    // 更新元数据：移除最新版本（当前版本已变为上一个）
+    const newVersions = versions.slice(1);
+    const metaToSave = newVersions.map(v => ({ version: v.version, date: v.date, size: v.size }));
+    writeFileSync(metaPath, JSON.stringify(metaToSave, null, 2), 'utf-8');
+    
+    return { success: true, content: prevContent, message: '已回滚到上一个版本', version: prevVersion.version };
+  } catch(e) {
+    console.log('[DEBUG] rollbackScript error:', e.message);
+    return { success: false, message: '回滚失败: ' + e.message };
+  }
+}
+
+/**
+ * 记录技能改进日志
+ * @param {string} cardId - 技能卡ID
+ * @param {string} action - 动作类型
+ * @param {object} details - 详情
+ */
+function logSkillImprovement(cardId, action, details) {
+  try {
+    const home = process.env.HOME || '/root';
+    const stateDir = process.env.OPENCLAW_STATE_DIR || `${home}/.openclaw`;
+    const dataDir = join(stateDir, '.auto-skill');
+    const logDir = join(dataDir, 'logs');
+    
+    // 确保日志目录存在
+    if (!existsSync(logDir)) {
+      try { execSync('mkdir -p "' + logDir + '"'); } catch(e) {}
+    }
+    
+    const logFile = join(logDir, 'improvements.jsonl');
+    const timestamp = new Date().toISOString();
+    const logEntry = JSON.stringify({ timestamp, cardId, action, ...details }) + '\n';
+    
+    // 追加到日志文件
+    const existing = existsSync(logFile) ? readFileSync(logFile, 'utf-8') : '';
+    writeFileSync(logFile, existing + logEntry, 'utf-8');
+    
+    console.log('[DEBUG] logSkillImprovement:', cardId, action);
+  } catch(e) {
+    console.log('[DEBUG] logSkillImprovement error:', e.message);
+  }
+}
 
 // ==================== 自动安装 ====================
 function autoInstall() {
@@ -41,13 +257,14 @@ function autoInstall() {
     const files = execSync('ls "' + scriptsDir + '" 2>/dev/null || echo ""').toString().trim().split(/\n/).filter(f => f);
     if (files.length === 0) {
       const srcDirs = [
+        join(__dirname, 'scripts'),  // 插件自带 scripts 目录（用户 clone 后即可用）
         join(stateDir, 'shared-skills', 'rocky-auto-skill', 'scripts'),
         join(stateDir, 'skills', 'rocky-auto-skill', 'scripts')
       ];
       for (const src of srcDirs) {
         if (existsSync(src)) {
           try {
-            execSync('cp -r "' + src + '/*" "' + scriptsDir + '/" 2>/dev/null || true');
+            execSync('cp -r "' + src + '/." "' + scriptsDir + '/" 2>/dev/null || true');
             console.log('[DEBUG] autoInstall: copied scripts from ' + src);
             installed = true;
             break;
@@ -63,7 +280,7 @@ function autoInstall() {
 }
 
 // ==================== 缓存 ====================
-let cache = { l3Skills: null, templates: null, ts: 0 };
+let cache = { skillsWithScripts: null, templates: null, ts: 0 };
 
 // 执行结果缓存（避免同一错误重复执行脚本，1分钟内不重复执行）
 const CACHE_TTL = 5 * 60 * 1000; // 5分钟
@@ -77,8 +294,8 @@ function isCacheValid() {
 function refreshCache() {
   if (isCacheValid()) { console.log("[DEBUG] cache valid, skip"); return; }
   console.log("[DEBUG] refreshCache rebuilding");
-  cache.l3Skills = getL3SkillsDirect();
-  console.log("[DEBUG] cache.l3Skills:", cache.l3Skills.length, cache.l3Skills.map(s=>s.id+'/'+s.title));
+  cache.skillsWithScripts = getSkillsWithScripts();
+  console.log("[DEBUG] cache.skillsWithScripts:", cache.skillsWithScripts.length, cache.skillsWithScripts.map(s=>s.id+'/'+s.title));
   cache.templates = findTemplateScriptsDirect();
   cache.ts = Date.now();
 }
@@ -95,13 +312,1210 @@ function setCachedExec(scriptPath, result) {
   execCache.set(scriptPath, { result, ts: Date.now() });
 }
 
+// ==================== 模型决策函数 ====================
+// 简化版：模型驱动，不需要硬编码晋升规则
+function askModelDecision(type, ctx) {
+  // create_card: 仅作为提示，模型最终决定
+  if (type === 'create_card') {
+    const isQuestion = (ctx.userMsg||'').length>=10 && /[吗？么什怎如何为什么]|\?|how|what|why|can/i.test(ctx.userMsg||'');
+    return { 
+      decision: isQuestion ? 'yes' : 'no',
+      title: (ctx.userMsg||'').slice(0,30).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g,'')
+    };
+  }
+  return { decision: 'no' };
+}
+
+// ==================== 反馈处理函数 ====================
+// 获取最近执行的技能
+// lastExecutedSkill 持久化到文件，避免网关重启后丢失
+const LAST_SKILL_FILE = () => join(getDataDir(), 'last_executed_skill.json');
+
+function loadLastExecutedSkill() {
+  try {
+    if (!existsSync(LAST_SKILL_FILE())) return null;
+    const content = readFileSync(LAST_SKILL_FILE(), 'utf-8');
+    const data = JSON.parse(content);
+    // 检查是否在5分钟窗口内
+    if (Date.now() - data.ts > 5 * 60 * 1000) {
+      try { unlinkSync(LAST_SKILL_FILE()); } catch(e) {}
+      return null;
+    }
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function saveLastExecutedSkill(data) {
+  try {
+    writeFileSync(LAST_SKILL_FILE(), JSON.stringify(data), 'utf-8');
+  } catch(e) {
+    console.log('[DEBUG] saveLastExecutedSkill error:', e.message);
+  }
+}
+
+let lastExecutedSkill = null; // { cardId, scriptPath, title, currentScript, ts }
+
+function setLastExecutedSkill(cardId, scriptPath, title, currentScript) {
+  lastExecutedSkill = { cardId, scriptPath, title, currentScript, ts: Date.now() };
+  saveLastExecutedSkill(lastExecutedSkill);
+  console.log('[DEBUG] setLastExecutedSkill called:', cardId, title, 'expires in 5min');
+}
+
+function getRecentExecutedScript() {
+  // 优先从内存获取
+  if (lastExecutedSkill) {
+    if (Date.now() - lastExecutedSkill.ts > 5 * 60 * 1000) {
+      lastExecutedSkill = null;
+      try { unlinkSync(LAST_SKILL_FILE()); } catch(e) {}
+      return null;
+    }
+    return lastExecutedSkill;
+  }
+  // 内存没有，从文件恢复
+  lastExecutedSkill = loadLastExecutedSkill();
+  return lastExecutedSkill;
+}
+
+// 从消息历史中查找最近讨论过的有脚本的技能
+function findRecentSkillFromMessages(messages, scriptsDir, skillsDir) {
+  if (!messages || messages.length === 0) return null;
+  
+  // 获取有脚本的技能列表（不再区分L3）
+  let skillsWithScripts = [];
+  try {
+    const cardsDir = join(dataDir, 'cards');
+    if (!existsSync(cardsDir)) return null;
+    const files = readdirSync(cardsDir).filter(f => f.endsWith('.yaml'));
+    for (const file of files) {
+      const content = readFileSync(join(cardsDir, file), 'utf-8');
+      // 不再检查 level，只要有 script 就收集
+      const scriptM = content.match(/^skill_script:\s*"?(.+?)"?\s*$/m);
+      if (scriptM) {
+        const idM = content.match(/^id:\s*(\d+)/m);
+        const titleM = content.match(/^title:\s*(.+)/m);
+        const scriptPath = join(skillsDir, scriptM[1]);
+        if (existsSync(scriptPath)) {
+          const scriptContent = readFileSync(scriptPath, 'utf-8');
+          skillsWithScripts.push({
+            id: idM ? idM[1] : '???',
+            title: titleM ? titleM[1] : '',
+            scriptPath: scriptPath,
+            scriptContent: scriptContent
+          });
+        }
+      }
+    }
+  } catch(e) {
+    console.log('[DEBUG] findRecentSkillFromMessages error:', e.message);
+    return null;
+  }
+  
+  if (skillsWithScripts.length === 0) return null;
+  
+  // 从最近的消息中查找提到的技能
+  const recentMsgs = (messages || []).slice(-10);
+  for (const msg of recentMsgs) {
+    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+    for (const skill of skillsWithScripts) {
+      // 检查消息是否提到这个技能
+      if (content.includes(skill.title) || skill.title.includes(content.slice(0, 20))) {
+        console.log('[DEBUG] findRecentSkillFromMessages: found', skill.id, skill.title);
+        return {
+          cardId: skill.id,
+          scriptPath: skill.scriptPath,
+          title: skill.title,
+          currentScript: skill.scriptContent,
+          ts: Date.now() - 60000 // 设为1分钟前，在5分钟窗口内
+        };
+      }
+    }
+  }
+  
+  return null;
+}
+
+// ==================== 上下文感知的脚本修改检测（Hermes式 - 模型驱动） ====================
+function detectContextScriptModification(userMsg, messages, recentSkill, scriptsDir, skillsDir) {
+  // 如果没有直接的 recentSkill，尝试从消息历史中找最近讨论过的技能
+  if (!recentSkill) {
+    recentSkill = findRecentSkillFromMessages(messages, scriptsDir, skillsDir);
+    if (!recentSkill) {
+      console.log('[DEBUG] detectContextScriptModification: no recent skill found in messages');
+      return null;
+    }
+    console.log('[DEBUG] detectContextScriptModification: found skill from messages:', recentSkill.cardId, recentSkill.title);
+  }
+
+  const { cardId, scriptPath, title, currentScript } = recentSkill;
+
+  // 检查是否在5分钟窗口内
+  if (Date.now() - recentSkill.ts > 5 * 60 * 1000) {
+    return null;
+  }
+
+  // 构建对话上下文
+  const recentMessages = (messages || []).slice(-6);
+  const contextText = recentMessages.map(m => {
+    const role = m.role === 'user' ? '用户' : '助手';
+    const content = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+    return `${role}: ${content}`;
+  }).join('\n');
+
+  // 构建LLM prompt，让模型判断是否需要增强
+  const prompt = `你是技能增强判断专家。
+
+当前技能：${title}
+当前脚本：
+${currentScript}
+
+最近对话：
+${contextText}
+
+用户最新消息：${userMsg}
+
+判断：用户是否想要增强这个技能？（比如：添加功能、补充信息、改进输出等）
+
+请仔细分析对话上下文，理解用户的真实意图。
+
+如果用户确实想要增强技能，请提取他们想要什么增强内容（用一句话描述）。
+如果用户不是要增强技能，请回答"不需要增强"。
+
+回答格式：
+- 如果需要增强："增强：<一句话描述用户想要的增强>"
+- 如果不需要："不需要增强"`;
+
+  try {
+    // 使用临时文件传递prompt，避免引号转义问题
+    const tmpFile = '/tmp/autoskill_prompt_' + Date.now() + '.txt';
+    const credsFile = '/tmp/autoskill_creds_' + Date.now() + '.json';
+    writeFileSync(tmpFile, prompt, 'utf-8');
+    
+    // 获取模型凭证
+    const creds = getModelCredentials();
+    if (!creds.apiKey) {
+      console.log('[DEBUG] LLM enhancement skipped: no API key available in config or env MINIMAX_API_KEY');
+      try { unlinkSync(tmpFile); } catch(e) {}
+      return null;
+    }
+    const apiKey = creds.apiKey;
+    const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
+    const apiType = creds.apiType || 'anthropic';
+    
+    // 构建请求头并写入临时文件
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+    if (apiType === 'anthropic') {
+      headers['anthropic-version'] = '2023-06-01';
+      headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    }
+    if (creds.authHeader) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    } else {
+      headers['x-api-key'] = apiKey;
+    }
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType }), 'utf-8');
+    
+    const result = execSync(`python3 -W ignore -c "
+import requests
+import json
+with open('${tmpFile}', 'r') as f:
+    prompt = f.read()
+with open('${credsFile}', 'r') as f:
+    creds = json.load(f)
+
+if creds.get('apiType') == 'openai':
+    # OpenAI 格式
+    resp = requests.post(
+        creds['baseUrl'] + '/chat/completions',
+        headers=creds['headers'],
+        json={
+            'model': 'glm-5.1',
+            'max_tokens': 100,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=15
+    )
+    data = resp.json()
+    choices = data.get('choices', [])
+    if choices and len(choices) > 0:
+        print(choices[0].get('message', {}).get('content', ''))
+    else:
+        print('ERROR')
+else:
+    # Anthropic 格式
+    resp = requests.post(
+        creds['baseUrl'] + '/v1/messages',
+        headers=creds['headers'],
+        json={
+            'model': 'MiniMax-M2.7',
+            'max_tokens': 100,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=15
+    )
+    data = resp.json()
+    content = data.get('content', [])
+    if content and len(content) > 0:
+        print(content[0].get('text', ''))
+    else:
+        print('ERROR')
+" 2>&1`, { encoding: 'utf-8', timeout: 20000 });
+
+    // 清理临时文件
+    try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {}
+
+    const trimmed = result.trim();
+    console.log('[DEBUG] LLM enhancement check:', trimmed.slice(0, 100));
+
+    if (trimmed === 'ERROR' || trimmed.includes('不需要增强') || trimmed.includes('不需要')) {
+      return null;
+    }
+
+    // 提取增强内容
+    let enhancement = trimmed;
+    if (trimmed.includes('增强：')) {
+      enhancement = trimmed.split('增强：')[1] || trimmed.split('增强:')[1] || '';
+    }
+    enhancement = enhancement.trim();
+
+    if (!enhancement || enhancement.length < 2) {
+      return null;
+    }
+
+    console.log('[DEBUG] LLM detected enhancement intent:', enhancement);
+    return { cardId, scriptPath, title, currentScript, enhancement };
+
+  } catch(e) {
+    console.log('[DEBUG] detectContextScriptModification error:', e.message);
+    return null;
+  }
+}
+
+// ==================== 智能脚本增强（模型驱动） ====================
+function applyScriptEnhancement(title, currentScript, enhancement) {
+  // 提取shebang和注释
+  const lines = currentScript.split('\n');
+  const shebangLines = [];
+  let bodyStartIdx = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].startsWith('#!') || lines[i].startsWith('#')) {
+      shebangLines.push(lines[i]);
+      bodyStartIdx = i + 1;
+    } else {
+      break;
+    }
+  }
+  const scriptBody = lines.slice(bodyStartIdx).join('\n').trim();
+
+  // 提取问题描述
+  const problemMatch = currentScript.match(/#\s*Problem:\s*(.+)/i);
+  const problem = problemMatch ? problemMatch[1].trim() : (title || '未知问题');
+
+  // 构建prompt让模型决定如何增强
+  const prompt = `你是一个Linux shell脚本专家。
+
+当前脚本：
+${scriptBody}
+
+用户想要增强："${enhancement}"
+
+问题背景：${problem}
+
+请生成增强后的完整shell脚本（保留shebang和注释，只修改脚本body）。
+要求：
+1. 在原脚本基础上智能增强，不要完全重写
+2. 添加用户要求的增强功能
+3. 用 && 或 || 连接多个命令
+4. 只输出脚本内容，不要解释
+
+输出格式：直接输出脚本内容`;
+
+  try {
+    // 使用临时文件传递prompt，避免引号转义问题
+    const tmpFile = '/tmp/autoskill_enhance_' + Date.now() + '.txt';
+    const credsFile = '/tmp/autoskill_creds_' + Date.now() + '.json';
+    writeFileSync(tmpFile, prompt, 'utf-8');
+    
+    // 获取模型凭证
+    const creds = getModelCredentials();
+    if (!creds.apiKey) {
+      console.log('[DEBUG] LLM enhancement skipped: no API key available in config or env MINIMAX_API_KEY');
+      try { unlinkSync(tmpFile); } catch(e) {}
+      return null;
+    }
+    const apiKey = creds.apiKey;
+    const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
+    const apiType = creds.apiType || 'anthropic';
+    
+    // 构建请求头并写入临时文件
+    const headers = {
+      'Content-Type': 'application/json'
+    };
+    if (apiType === 'anthropic') {
+      headers['anthropic-version'] = '2023-06-01';
+      headers['anthropic-dangerous-direct-browser-access'] = 'true';
+    }
+    if (creds.authHeader) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    } else {
+      headers['x-api-key'] = apiKey;
+    }
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType }), 'utf-8');
+    
+    const result = execSync(`python3 -W ignore -c "
+import requests
+import json
+with open('${tmpFile}', 'r') as f:
+    prompt = f.read()
+with open('${credsFile}', 'r') as f:
+    creds = json.load(f)
+
+if creds.get('apiType') == 'openai':
+    # OpenAI 格式
+    resp = requests.post(
+        creds['baseUrl'] + '/chat/completions',
+        headers=creds['headers'],
+        json={
+            'model': 'glm-5.1',
+            'max_tokens': 500,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=15
+    )
+    data = resp.json()
+    choices = data.get('choices', [])
+    if choices and len(choices) > 0:
+        print(choices[0].get('message', {}).get('content', ''))
+    else:
+        print('ERROR')
+else:
+    # Anthropic 格式
+    resp = requests.post(
+        creds['baseUrl'] + '/v1/messages',
+        headers=creds['headers'],
+        json={
+            'model': 'MiniMax-M2.7',
+            'max_tokens': 500,
+            'messages': [{'role': 'user', 'content': prompt}]
+        },
+        timeout=15
+    )
+    data = resp.json()
+    content = data.get('content', [])
+    if content and len(content) > 0:
+        print(content[0].get('text', ''))
+    else:
+        print('ERROR')
+" 2>&1`, { encoding: 'utf-8', timeout: 20000 });
+
+    const trimmed = result.trim();
+    if (trimmed === 'ERROR' || !trimmed) {
+      console.log('[DEBUG] applyScriptEnhancement: LLM call failed');
+      try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {}
+      return currentScript;
+    }
+    // 清理临时文件
+    try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {}
+
+    // 重建完整脚本（保留shebang和注释）
+    const newBody = trimmed.replace(/^#!/,'echo "skip" && #!').split('\n').filter(l => !l.match(/^echo "skip"/)).join('\n');
+    const newScript = shebangLines.length > 0
+      ? shebangLines.join('\n') + '\n' + newBody
+      : newBody;
+
+    console.log('[DEBUG] applyScriptEnhancement: LLM generated new script');
+    return newScript;
+
+  } catch(e) {
+    console.log('[DEBUG] applyScriptEnhancement error:', e.message);
+    return currentScript;
+  }
+}
+
+// 根据反馈生成新脚本
+function generateScriptFromFeedback(feedback, title, currentScript) {
+  const titleLower = (title || '').toLowerCase();
+  const feedbackLower = (feedback || '').toLowerCase();
+
+  // 分析反馈内容
+  const wantsMore = /还要|加|增加|多|包含|加上/.test(feedback);
+  const wantsDifferent = /不对|不是|应该|不是这样|说错了/.test(feedback);
+  const wantsReplace = /改成|改为|换成|重新|再来/.test(feedback);
+
+  let newScript = currentScript;
+
+  // 内存相关
+  if (titleLower.includes('内存') || titleLower.includes('mem')) {
+    if (wantsMore && (feedbackLower.includes('swap') || feedbackLower.includes('交换'))) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\nfree -h && echo "---" && swapon --show && echo "---" && ps aux --sort=-%mem | head -11';
+    } else if (wantsMore && (feedbackLower.includes('详细') || feedbackLower.includes('更多'))) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\necho "=== 内存使用 ===" && free -h && echo "=== Swap 使用 ===" && swapon --show && echo "=== 进程排名 Top15 ===" && ps aux --sort=-%mem | head -16';
+    } else if (wantsReplace || wantsDifferent) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\necho "free -h 显示内存，ps aux --sort=-%mem | head 显示进程"';
+    }
+  }
+  // CPU相关
+  else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
+    if (wantsMore) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\necho "=== CPU 信息 ===" && lscpu && echo "=== CPU 使用 Top10 ===" && ps aux --sort=-%cpu | head -11';
+    }
+  }
+  // 磁盘相关
+  else if (titleLower.includes('disk') || titleLower.includes('磁盘') || titleLower.includes('硬盘')) {
+    if (wantsMore) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\ndf -h && echo "---" && du -sh /* 2>/dev/null | sort -hr | head -10';
+    }
+  }
+  // 进程相关
+  else if (titleLower.includes('进程') || titleLower.includes('process')) {
+    if (wantsMore) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\nps aux && echo "---" && pstree -p && echo "=== 资源使用 Top10 ===" && ps aux --sort=-%mem | head -11';
+    }
+  }
+
+  // 如果没有变化，返回原脚本
+  if (newScript === currentScript) {
+    console.log('[DEBUG] generateScriptFromFeedback: no change needed');
+    return currentScript;
+  }
+
+  return newScript;
+}
+
+// ==================== 自动分析执行结果并优化脚本 ====================
+async function analyzeAndOptimizeScript(cardId, scriptPath, title, output) {
+  try {
+    // 检查输出是否为空或过短（可能不完整）
+    if (!output || output.trim().length < 10) {
+      console.log('[DEBUG] analyzeAndOptimize: output too short, skipping');
+      return;
+    }
+
+    // 简单的启发式分析
+    const titleLower = (title || '').toLowerCase();
+    let needsMore = false;
+    let suggestion = '';
+
+    // 内存相关检查
+    if (titleLower.includes('内存') || titleLower.includes('mem')) {
+      if (!output.includes('Mem:') && !output.includes('内存')) {
+        needsMore = true;
+        suggestion = '添加 free -h 显示内存总量和使用情况';
+      }
+      if (!output.includes('Swap:') && !output.includes('swap') && !output.includes('交换')) {
+        needsMore = true;
+        suggestion = '添加 swap 使用情况显示';
+      }
+    }
+
+    // CPU相关检查
+    if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
+      if (!output.includes('CPU') && !output.includes('cpu')) {
+        needsMore = true;
+        suggestion = '添加 lscpu 显示 CPU 信息';
+      }
+    }
+
+    // 进程相关检查
+    if (titleLower.includes('进程') || titleLower.includes('process')) {
+      if (!output.includes('PID') && !output.includes('USER')) {
+        needsMore = true;
+        suggestion = '添加完整的进程列表';
+      }
+    }
+
+    if (!needsMore) {
+      console.log('[DEBUG] analyzeAndOptimize: output looks good for', title);
+      return;
+    }
+
+    console.log('[DEBUG] analyzeAndOptimize: suggesting improvement:', suggestion);
+
+    // 根据建议生成优化后的脚本
+    let newScript = '#!/bin/bash\n# Auto-generated skill script (optimized)\n# Problem: ' + title + '\n';
+
+    if (titleLower.includes('内存') || titleLower.includes('mem')) {
+      newScript += 'echo "=== 内存使用情况 ===" && free -h && echo "=== Swap 使用情况 ===" && swapon --show && echo "=== 进程内存使用 Top15 ===" && ps aux --sort=-%mem | head -16';
+    } else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
+      newScript += 'echo "=== CPU 信息 ===" && lscpu && echo "=== CPU 使用 Top10 ===" && ps aux --sort=-%cpu | head -11';
+    } else if (titleLower.includes('磁盘') || titleLower.includes('disk')) {
+      newScript += 'df -h && echo "=== 目录占用 Top10 ===" && du -sh /* 2>/dev/null | sort -hr | head -10';
+    } else if (titleLower.includes('进程') || titleLower.includes('process')) {
+      newScript += 'ps aux && echo "=== 进程树 ===" && pstree -p && echo "=== 资源 Top10 ===" && ps aux --sort=-%mem | head -11';
+    } else {
+      newScript += output.split('\n')[0]; // 保留原有输出
+    }
+
+    // 更新脚本
+    writeFileSync(scriptPath, newScript, 'utf-8');
+    chmodSync(scriptPath, 0o755);
+    console.log('[DEBUG] analyzeAndOptimize: script updated for card:', cardId);
+
+    // 记录优化日志
+    const logsDir = join(getDataDir(), 'logs');
+    if (!existsSync(logsDir)) {
+      require('fs').mkdirSync(logsDir, { recursive: true });
+    }
+    const logFile = join(logsDir, 'optimize.log');
+    const logEntry = `[${new Date().toISOString()}]优化技能 ${cardId} (${title}): ${suggestion}\n`;
+    appendFileSync(logFile, logEntry, 'utf-8');
+
+  } catch(e) {
+    console.log('[DEBUG] analyzeAndOptimize error:', e.message);
+  }
+}
+
+// ==================== 工作流模式识别（模型判断） ====================
+const WORKFLOW_DIR = join(process.env.OPENCLAW_STATE_DIR || (process.env.HOME || '/root') + '/.openclaw', '.auto-skill', 'workflows');
+const WORKFLOW_SEQ_TTL = 30 * 60 * 1000; // 30分钟会话窗口
+
+// 工具调用阈值（超过此阈值准备生成技能）- 仅作为快速参考，模型决定主判断
+const WORKFLOW_TOOL_THRESHOLD = 5;
+
+// 会话级消息缓存
+let workflowCache = {
+  sessionKey: null,
+  messages: [],
+  taskCompleted: false,
+  ts: 0,
+  lastAssistantOutput: null,
+  lastWorkflow: null
+};
+
+function ensureWorkflowDir() {
+  try {
+    if (!existsSync(WORKFLOW_DIR)) {
+      require('fs').mkdirSync(WORKFLOW_DIR, { recursive: true });
+    }
+  } catch {}
+}
+
+function getExistingWorkflow() {
+  ensureWorkflowDir();
+  try {
+    const wfPath = join(WORKFLOW_DIR, 'current.json');
+    if (existsSync(wfPath)) {
+      return JSON.parse(readFileSync(wfPath, 'utf-8'));
+    }
+  } catch {}
+  return null;
+}
+
+function saveWorkflowFile(workflow) {
+  ensureWorkflowDir();
+  try {
+    writeFileSync(join(WORKFLOW_DIR, 'current.json'), JSON.stringify(workflow, null, 2), 'utf-8');
+  } catch(e) {
+    console.log('[DEBUG] workflow save error:', e.message);
+  }
+}
+
+// ==================== 每日沉寂扫描 ====================
+const SCAN_STATE_FILE = join(process.env.OPENCLAW_STATE_DIR || (process.env.HOME || '/root') + '/.openclaw', '.auto-skill', '.decay-scan-state');
+
+function getLastScanDate() {
+  try {
+    if (existsSync(SCAN_STATE_FILE)) {
+      const data = JSON.parse(readFileSync(SCAN_STATE_FILE, 'utf-8'));
+      return data.lastScanDate || null;
+    }
+  } catch {}
+  return null;
+}
+
+function setLastScanDate(date) {
+  try {
+    writeFileSync(SCAN_STATE_FILE, JSON.stringify({ lastScanDate: date }), 'utf-8');
+  } catch {}
+}
+
+async function dailyDecayScan() {
+  const today = new Date().toISOString().slice(0, 10);
+  const lastScan = getLastScanDate();
+
+  // 每天只扫描一次
+  if (lastScan === today) {
+    console.log('[DEBUG] daily scan: already ran today');
+    return;
+  }
+
+  console.log('[DEBUG] daily scan: starting...');
+  setLastScanDate(today);
+
+  const dataDir = getDataDir();
+  const cardsDir = join(dataDir, 'cards');
+  const skillsDir = join(dataDir, 'skills');
+
+  if (!existsSync(cardsDir)) return;
+
+  // 收集所有技能的使用统计
+  const skillStats = [];
+  try {
+    const files = readdirSync(cardsDir).filter(f => f.endsWith('.yaml'));
+    const now = Date.now();
+    for (const f of files) {
+      const content = readFileSync(join(cardsDir, f), 'utf-8');
+      const lastHit = content.match(/^last_hit_at:\s*(\S+)/m);
+      const hitCount = content.match(/^hit_count:\s*(\d+)/m);
+      const level = content.match(/^level:\s*(\S+)/m);
+      const title = content.match(/^title:\s*"?([^"\n]+)"?/m);
+      const cardId = content.match(/^id:\s*(\S+)/m);
+      const scriptM = content.match(/^skill_script:\s*"?([^"\n]+)"?/m);
+
+      if (lastHit && cardId) {
+        const lastDate = new Date(lastHit[1]);
+        const daysUnused = Math.floor((now - lastDate.getTime()) / (1000 * 60 * 60 * 24));
+        skillStats.push({
+          cardId: cardId[1],
+          title: title ? title[1] : '未知',
+          level: level ? level[1] : 'L1',
+          hitCount: hitCount ? parseInt(hitCount[1]) : 0,
+          daysUnused,
+          scriptExists: scriptM ? existsSync(join(skillsDir, scriptM[1])) : false
+        });
+      }
+    }
+  } catch(e) {
+    console.log('[DEBUG] daily scan: error reading cards:', e.message);
+    return;
+  }
+
+  if (skillStats.length === 0) {
+    console.log('[DEBUG] daily scan: no skills to analyze');
+    return;
+  }
+
+  // 让模型判断哪些该删除
+  const statsText = skillStats.map(s =>
+    `- [${s.cardId}] "${s.title}" (${s.level}): ${s.hitCount}次使用, ${s.daysUnused}天未用`
+  ).join('\n');
+
+  const prompt = `你是经验系统的管理员。请分析以下技能使用情况，判断哪些应该删除。
+
+技能统计：
+${statsText}
+
+请根据实际情况判断：
+- 长期不用的技能可以删除
+- 但有价值的技能（高频使用、刚创建不久）要保留
+- 给每条删除指令写出具体原因
+
+输出指令：
+[DECAY_DELETE]
+[
+  {"cardId": "ID1", "reason": "原因"},
+  {"cardId": "ID2", "reason": "原因"}
+]
+[/DECAY_DELETE]
+
+如果没有技能该删除，输出：
+[DECAY_DELETE]
+[]
+[/DECAY_DELETE]
+
+只输出指令。`;
+
+  // 获取模型凭证
+  const creds = getModelCredentials();
+  if (!creds.apiKey) {
+    console.log('[DEBUG] daily scan: skipped, no API key available');
+    return;
+  }
+
+  try {
+    // 构建请求头
+    const headers = {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+    if (creds.authHeader) {
+      headers['Authorization'] = `Bearer ${creds.apiKey}`;
+    } else {
+      headers['x-api-key'] = creds.apiKey;
+    }
+
+    // 构建Python脚本
+    const escapedPrompt = prompt.replace(/'/g, "\\'");
+    const pythonScript = `
+import requests
+import json
+resp = requests.post(
+    '${creds.baseUrl}/v1/messages',
+    headers=${JSON.stringify(headers)},
+    json={
+        'model': 'MiniMax-M2.7-highspeed',
+        'max_tokens': 2000,
+        'messages': [{'role': 'user', 'content': '${escapedPrompt}'}]
+    },
+    timeout=60
+)
+print(resp.json()['content'][0]['text'][:4000])
+`;
+
+    const result = execSync(`python3 -W ignore -c "${pythonScript}" 2>/dev/null`, { encoding: 'utf-8', timeout: 70000 });
+
+    // 解析删除指令
+    const deleteMatch = result.match(/\[DECAY_DELETE\]\s*([\s\S]*?)\s*\[\/DECAY_DELETE\]/);
+    if (deleteMatch && deleteMatch[1]) {
+      const jsonMatch = deleteMatch[1].match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const deleteList = JSON.parse(jsonMatch[0]);
+        if (Array.isArray(deleteList) && deleteList.length > 0) {
+          console.log('[DEBUG] daily scan: deleting', deleteList.length, 'skills');
+          for (const item of deleteList) {
+            if (item.cardId) {
+              deleteSkill(item.cardId, dataDir);
+              console.log('[DEBUG] daily scan: deleted', item.cardId, 'reason:', item.reason);
+            }
+          }
+        } else {
+          console.log('[DEBUG] daily scan: no skills to delete');
+        }
+      }
+    }
+  } catch(e) {
+    console.log('[DEBUG] daily scan: model error:', e.message.slice(0, 100));
+  }
+}
+
+// 提取对话内容
+function extractContent(msg) {
+  if (!msg) return '';
+  if (typeof msg === 'string') return msg;
+  if (Array.isArray(msg)) {
+    return msg.map(m => typeof m === 'string' ? m : (m.text || '')).join(' ');
+  }
+  if (msg.text) return msg.text;
+  return '';
+}
+
+// 模型分析工作流
+async function analyzeWithModel(history, context) {
+  if (history.length < 2) return null;
+
+  const conversationText = history.map((m, i) => `${i+1}. [${m.role}] ${m.content.slice(0, 300)}`).join('\n');
+
+  // 获取技能使用情况
+  let skillStats = '';
+  try {
+    const dataDir = getDataDir();
+    const cardsDir = join(dataDir, 'cards');
+    const files = readdirSync(cardsDir).filter(f => f.endsWith('.yaml'));
+    const now = Date.now();
+    for (const f of files.slice(0, 20)) {
+      const content = readFileSync(join(cardsDir, f), 'utf-8');
+      const lastHit = content.match(/^last_hit_at:\s*(\S+)/m);
+      const hitCount = content.match(/^hit_count:\s*(\d+)/m);
+      const title = content.match(/^title:\s*"?([^"\n]+)"?/m);
+      if (lastHit && title) {
+        const lastDate = new Date(lastHit[1]);
+        const daysUnused = Math.floor((now - lastDate.getTime()) / (1000 * 60 * 60 * 24));
+        skillStats += `- ${title[1]}: 最后使用${daysUnused}天前, hit=${hitCount ? hitCount[1] : 0}\n`;
+      }
+    }
+  } catch {}
+
+  // 获取目标系统信息
+  const osType = require('os').type() === 'Darwin' ? 'macOS' : 'Linux';
+
+  const prompt = `你是经验系统的大脑。你需要分析对话，判断是否需要生成、优化或删除技能。
+
+目标系统：${osType}（生成的脚本必须兼容此系统）
+
+对话历史：
+${conversationText}
+
+技能使用情况：
+${skillStats || '(无技能数据)'}
+
+你的判断：
+1. 任务是否完成？是否需要生成新技能？
+2. 用户是否有反馈说技能执行结果不对/有偏差？
+3. 是否有技能长期不用（>30天）应该删除？
+
+重要：${osType} 系统下，进程相关命令：
+- 内存：ps -eo pid,comm,%mem,rss | sort -k3 -rn
+- CPU：ps -eo pid,comm,%cpu,rss | sort -k3 -rn
+- 进程：ps aux | head -20
+
+输出指令：
+
+[WORKFLOW_GEN] 生成新技能（脚本必须兼容${osType}）
+{"workflowId": "ID", "title": "标题", "description": "描述", "scriptTemplate": "bash脚本，兼容${osType}", "trigger": "触发条件", "example": "示例"}
+
+[SKILL_UPDATE] 更新技能
+{"cardId": "ID", "reason": "原因", "newScript": "新脚本（兼容${osType}）"}
+
+[SKILL_DELETE] 删除技能
+{"cardId": "ID", "reason": "原因"}
+
+[NO_OP] 无操作
+
+只输出指令，不要其他内容。`;
+
+  // 获取模型凭证
+  const creds = getModelCredentials();
+  if (!creds.apiKey) {
+    console.log('[DEBUG] analyzeWithModel: skipped, no API key available');
+    return null;
+  }
+
+  try {
+    // 构建请求头
+    const headers = {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+    if (creds.authHeader) {
+      headers['Authorization'] = `Bearer ${creds.apiKey}`;
+    } else {
+      headers['x-api-key'] = creds.apiKey;
+    }
+
+    // 构建Python脚本
+    const escapedPrompt = prompt.replace(/'/g, "\\'");
+    const pythonScript = `
+import requests
+resp = requests.post(
+    '${creds.baseUrl}/v1/messages',
+    headers=${JSON.stringify(headers)},
+    json={
+        'model': 'MiniMax-M2.7-highspeed',
+        'max_tokens': 2000,
+        'messages': [{'role': 'user', 'content': '${escapedPrompt}'}]
+    },
+    timeout=60
+)
+print(resp.json()['content'][0]['text'][:4000])
+`;
+
+    const result = execSync(`python3 -W ignore -c "${pythonScript}" 2>/dev/null`, { encoding: 'utf-8', timeout: 70000 });
+
+    const jsonMatch = result.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const wf = JSON.parse(jsonMatch[0]);
+      if (wf && wf.workflowId) {
+        console.log('[DEBUG] workflow: model found:', wf.title, 'script:', wf.scriptTemplate?.slice(0, 50));
+        // 返回带类型的对象
+        return { type: 'WORKFLOW_GEN', data: wf };
+      }
+    }
+    // 检查是否有其他指令
+    const instruction = detectModelInstruction(result);
+    if (instruction) return instruction;
+  } catch(e) {
+    console.log('[DEBUG] workflow: model error:', e.message.slice(0, 100));
+  }
+  return null;
+}
+
+// 创建工作流技能
+async function createWorkflowSkill(workflow, sessionDir) {
+  try {
+    ensureWorkflowDir();
+    const existingFiles = readdirSync(join(sessionDir, 'cards')).filter(f => f.endsWith('.yaml'));
+    let maxId = 0;
+    for (const f of existingFiles) {
+      const match = f.match(/^(\d+)/);
+      if (match) maxId = Math.max(maxId, parseInt(match[1]));
+    }
+    const cardId = String(maxId + 1).padStart(3, '0');
+
+    const scriptName = `${cardId}-wf-${workflow.workflowId}.sh`;
+    const scriptPath = join(sessionDir, 'skills', scriptName);
+    const scriptContent = `#!/bin/bash
+# AI Generated Workflow: ${workflow.title}
+# ${workflow.trigger || ''}
+# Created: ${new Date().toISOString()}
+
+${workflow.scriptTemplate}
+`;
+    writeFileSync(scriptPath, scriptContent, 'utf-8');
+    chmodSync(scriptPath, 0o755);
+
+    const cardContent = `# rocky-auto-skill 工作流技能（AI分析生成）
+id: ${cardId}
+title: "${workflow.title}"
+tool: workflow
+tags: [workflow, ai-generated]
+category: workflow
+
+level: L3
+hit_count: 1
+source: workflow_ai
+
+created_at: ${new Date().toISOString().slice(0, 10)}
+last_hit_at: ${new Date().toISOString().slice(0, 10)}
+updated_at: ${new Date().toISOString().slice(0, 10)}
+status: active
+
+problem: |
+  ${workflow.description || workflow.trigger}
+
+solution: |
+  ${workflow.scriptTemplate}
+
+skill_script: "${scriptName}"
+workflow_id: "${workflow.workflowId}"
+workflow_trigger: "${workflow.trigger || ''}"
+workflow_example: "${workflow.example || ''}"
+`;
+    writeFileSync(join(sessionDir, 'cards', `${cardId}-wf-${workflow.workflowId}.yaml`), cardContent, 'utf-8');
+    console.log('[DEBUG] workflow: created skill, card:', cardId, 'script:', scriptName);
+    cache.ts = 0;
+    return { cardId, scriptName };
+  } catch(e) {
+    console.log('[DEBUG] workflow: create error:', e.message);
+    return null;
+  }
+}
+
+// 处理工作流
+async function processWorkflow(sessionKey, messages, sessionDir) {
+  const now = Date.now();
+
+  // 初始化或超时重置
+  if (workflowCache.sessionKey !== sessionKey || (now - workflowCache.ts) > WORKFLOW_SEQ_TTL) {
+    workflowCache = { sessionKey, messages: [], taskCompleted: false, ts: now, lastAssistantOutput: null, lastWorkflow: null };
+  }
+  workflowCache.ts = now;
+
+  // 从消息中提取最新的 assistant 输出，检测 [SKILL_UPDATE] 标记
+  let latestAssistantOutput = null;
+  for (const m of messages) {
+    if (m.role === 'assistant' && m.content) {
+      const content = extractContent(m.content);
+      if (content && content.length > 0) {
+        latestAssistantOutput = content.slice(0, 2000);
+      }
+    }
+  }
+
+  // 如果有新的模型输出，检测指令
+  if (latestAssistantOutput && latestAssistantOutput !== workflowCache.lastAssistantOutput) {
+    workflowCache.lastAssistantOutput = latestAssistantOutput;
+    const instruction = detectModelInstruction(latestAssistantOutput);
+    if (instruction) {
+      console.log('[DEBUG] workflow: detected instruction:', instruction.type);
+      if (instruction.type === 'SKILL_UPDATE') {
+        // 优先从内存中的 lastWorkflow 获取，否则从磁盘获取
+        const wf = workflowCache.lastWorkflow || getExistingWorkflow();
+        if (wf && (wf.cardId || wf.id)) {
+          const cardId = wf.cardId || wf.id;
+          const cardFiles = readdirSync(join(sessionDir, 'cards')).filter(f => f.includes(cardId));
+          if (cardFiles.length > 0) {
+            const cardContent = readFileSync(join(sessionDir, 'cards', cardFiles[0]), 'utf-8');
+            const scriptM = cardContent.match(/^skill_script:\s*"?([^"\n]+)"?/m);
+            const idM = cardContent.match(/^id:\s*(\S+)/m);
+            const titleM = cardContent.match(/^title:\s*"?([^"\n]+)"?/m);
+            if (scriptM && idM) {
+              const skillCard = {
+                id: idM[1],
+                title: titleM ? titleM[1] : '',
+                skill_script: scriptM[1]
+              };
+              const updated = applySkillUpdate(skillCard, instruction.data, sessionDir);
+              if (updated) {
+                console.log('[DEBUG] workflow: skill updated successfully');
+                cache.ts = 0;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // 收集对话历史用于模型分析
+  for (const m of messages) {
+    const content = extractContent(m.content);
+    if (content && !workflowCache.messages.some(pm => pm.content === content.slice(0, 200))) {
+      workflowCache.messages.push({
+        role: m.role || 'unknown',
+        content: content.slice(0, 500),
+        timestamp: now
+      });
+    }
+  }
+
+  // 保留最近50条消息
+  if (workflowCache.messages.length > 50) {
+    workflowCache.messages = workflowCache.messages.slice(-50);
+  }
+
+  // 检查是否已创建（优先内存，其次磁盘）
+  const existing = workflowCache.lastWorkflow || getExistingWorkflow();
+  if (existing && existing.registered) {
+    return existing;
+  }
+
+  // 模型判断触发：当消息足够多时，让模型判断是否需要生成/更新技能
+  // 简化逻辑：直接让模型分析，模型自己决定是否需要操作
+  if (!workflowCache.preparingSkill && !workflowCache.skillReady && workflowCache.messages.length >= 6) {
+    workflowCache.preparingSkill = true;
+    console.log('[DEBUG] workflow: requesting model judgment, messages:', workflowCache.messages.length);
+    const result = await analyzeWithModel(workflowCache.messages);
+      // result 是 detectModelInstruction 解析后的对象 { type, data }
+
+      if (result && result.type === 'WORKFLOW_GEN') {
+        // 模型判断需要生成技能
+        const workflow = result.data;
+        workflow.registered = false;
+        const createResult = await createWorkflowSkill(workflow, sessionDir);
+        if (createResult) {
+          workflow.cardId = createResult.cardId;
+          workflow.scriptName = createResult.scriptName;
+          workflow.registered = true;
+          workflowCache.skillReady = true;
+          workflowCache.lastWorkflow = workflow;
+          workflow.createdAt = new Date().toISOString();
+          saveWorkflowFile(workflow);
+          return workflow;
+        }
+      } else if (result && result.type === 'SKILL_UPDATE') {
+        // 模型判断需要更新技能，指令在上面已处理
+        workflowCache.preparingSkill = false;
+      } else if (result && result.type === 'SKILL_DELETE') {
+        // 模型判断需要删除技能
+        if (result.data && result.data.cardId) {
+          deleteSkill(result.data.cardId, sessionDir);
+        }
+        workflowCache.preparingSkill = false;
+      } else {
+        // NO_OP 或无效，重置状态允许后续重试
+        workflowCache.preparingSkill = false;
+        console.log('[DEBUG] workflow: model decided no action needed');
+      }
+    }
+  return null;
+}
+
+// 检查是否正在准备生成技能
+function isPreparingSkill() {
+  return workflowCache.preparingSkill && !workflowCache.skillReady;
+}
+
+// 从模型输出中检测指令
+function detectModelInstruction(modelOutput) {
+  if (!modelOutput) return null;
+  try {
+    // 检查是否生成新技能
+    const genMatch = modelOutput.match(/\[WORKFLOW_GEN\]\s*([\s\S]*?)\s*\[\/WORKFLOW_GEN\]/);
+    if (genMatch && genMatch[1]) {
+      const content = genMatch[1].trim();
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return { type: 'WORKFLOW_GEN', data: JSON.parse(jsonMatch[0]) };
+      }
+    }
+    // 检查是否更新技能
+    const updateMatch = modelOutput.match(/\[SKILL_UPDATE\]\s*([\s\S]*?)\s*\[\/SKILL_UPDATE\]/);
+    if (updateMatch && updateMatch[1]) {
+      const content = updateMatch[1].trim();
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return { type: 'SKILL_UPDATE', data: JSON.parse(jsonMatch[0]) };
+      }
+      return { type: 'SKILL_UPDATE', data: { newScript: content } };
+    }
+    // 检查是否删除技能
+    const deleteMatch = modelOutput.match(/\[SKILL_DELETE\]\s*([\s\S]*?)\s*\[\/SKILL_DELETE\]/);
+    if (deleteMatch && deleteMatch[1]) {
+      const content = deleteMatch[1].trim();
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return { type: 'SKILL_DELETE', data: JSON.parse(jsonMatch[0]) };
+      }
+      return { type: 'SKILL_DELETE', data: { reason: content } };
+    }
+    // 检查是否无操作
+    if (modelOutput.includes('[NO_OP]')) {
+      return { type: 'NO_OP' };
+    }
+  } catch {}
+  return null;
+}
+
+// 删除技能
+function deleteSkill(cardId, sessionDir) {
+  try {
+    const cardsDir = join(sessionDir, 'cards');
+    const skillsDir = join(sessionDir, 'skills');
+    const cardFiles = readdirSync(cardsDir).filter(f => f.includes(cardId));
+    for (const cardFile of cardFiles) {
+      const cardPath = join(cardsDir, cardFile);
+      const content = readFileSync(cardPath, 'utf-8');
+      const scriptM = content.match(/^skill_script:\s*"?([^"\n]+)"?/m);
+      if (scriptM && scriptM[1]) {
+        const scriptPath = join(skillsDir, scriptM[1]);
+        if (existsSync(scriptPath)) {
+          execSync(`rm -f "${scriptPath}"`);
+        }
+      }
+      execSync(`rm -f "${cardPath}"`);
+    }
+    console.log('[DEBUG] workflow: deleted skill:', cardId);
+    cache.ts = 0;
+    return true;
+  } catch(e) {
+    console.log('[DEBUG] workflow: delete skill error:', e.message);
+  }
+  return false;
+}
+
+// 更新技能脚本
+function applySkillUpdate(skillCard, update, sessionDir) {
+  try {
+    const scriptPath = join(sessionDir, 'skills', skillCard.skill_script);
+    if (!existsSync(scriptPath)) return false;
+
+    const newScript = update.newScript || update.script;
+    if (!newScript) return false;
+
+    // 更新前先备份当前版本
+    backupScript(scriptPath);
+
+    writeFileSync(scriptPath, `#!/bin/bash\n# Auto-updated by model\n# ${update.reason || ''}\n\n${newScript}\n`, 'utf-8');
+    chmodSync(scriptPath, 0o755);
+
+    // 更新卡片
+    const cardFiles = readdirSync(join(sessionDir, 'cards')).filter(f => f.startsWith(skillCard.id));
+    for (const cardFile of cardFiles) {
+      let cardContent = readFileSync(join(sessionDir, 'cards', cardFile), 'utf-8');
+      cardContent = cardContent.replace(/^updated_at:.*$/m, `updated_at: ${new Date().toISOString().slice(0, 10)}`);
+      writeFileSync(join(sessionDir, 'cards', cardFile), cardContent, 'utf-8');
+    }
+
+    // 记录改进日志
+    logSkillImprovement(skillCard.id, 'apply_update', {
+      reason: update.reason || '',
+      scriptPath: scriptPath
+    });
+
+    console.log('[DEBUG] workflow: skill updated by model:', skillCard.id, update.reason || '');
+    cache.ts = 0;
+    return true;
+  } catch(e) {
+    console.log('[DEBUG] workflow: apply update error:', e.message);
+  }
+  return false;
+}
+
 // ==================== 路径 ====================
 function getScriptsDir() {
   const home = process.env.HOME || '/root';
   const stateDir = process.env.OPENCLAW_STATE_DIR || `${home}/.openclaw`;
-  const candidates = [join(stateDir, 'skills', 'rocky-auto-skill', 'scripts')];
+  const candidates = [
+    join(__dirname, 'scripts'),  // 插件自带 scripts 目录
+    join(stateDir, 'skills', 'rocky-auto-skill', 'scripts')
+  ];
   const ws = process.env.OPENCLAW_WORKSPACE;
-  if (ws) candidates.unshift(join(ws, 'skills', 'rocky-auto-skill', 'scripts'));
+  if (ws) candidates.splice(1, 0, join(ws, 'skills', 'rocky-auto-skill', 'scripts'));
   for (const dir of candidates) {
     if (existsSync(join(dir, 'autoskill-search'))) return dir;
   }
@@ -110,7 +1524,8 @@ function getScriptsDir() {
 
 function getDataDir() {
   const home = process.env.HOME || '/root';
-  return process.env.AUTOSKILL_DIR || `${home}/.openclaw/.auto-skill`;
+  const stateDir = process.env.OPENCLAW_STATE_DIR || `${home}/.openclaw`;
+  return process.env.AUTOSKILL_DIR || `${stateDir}/.auto-skill`;
 }
 
 // ==================== 搜索 ====================
@@ -127,7 +1542,7 @@ function searchCards(scriptsDir, keyword) {
   }
 }
 
-// ==================== 自动执行 L3 脚本 ====================
+// ==================== 自动执行脚本 ====================
 function autoExecuteScript(scriptPath, cardId, title) {
   // 检查缓存
   const cached = getCachedExec(scriptPath);
@@ -216,41 +1631,122 @@ function extractUserMessageKeywords(messages) {
 // 从prompt字符串中提取最后一条用户消息（用于before_agent_start等事件）
 function extractUserMessageKeywordsFromPrompt(promptStr) {
   if (!promptStr || typeof promptStr !== 'string') return '';
-  
-  // 直接取prompt最后200字符中的非JSON内容
-  const lastPart = promptStr.slice(-200);
-  const lines = lastPart.split('\n');
-  
+
+  // 用户消息在 <<<END_OPENCLAW_INTERNAL_CONTEXT>>> 标记之后，格式如：
+  // [Sun 2026-04-19 08:04 GMT+8] 用户消息内容
+  const marker = '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>';
+  const markerIdx = promptStr.lastIndexOf(marker);
+  const searchStr = markerIdx >= 0 ? promptStr.slice(markerIdx + marker.length) : promptStr.slice(-500);
+  const lines = searchStr.split('\n');
+
+  // 收集所有可能是用户消息的行
+  const candidates = [];
+
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     const trimmed = line.trim();
-    
+
     if (trimmed.length === 0) continue;
-    if (trimmed.startsWith('{') || trimmed.startsWith('```') || trimmed.startsWith('"') || 
-        trimmed.includes('Conversation info') || trimmed.includes('timestamp') || 
-        trimmed.includes('sender') || trimmed.includes('message_id') ||
-        /^[\[\(]\w+\s+\d{4}-\d{2}-\d{2}/.test(trimmed) || /GMT/.test(trimmed)) {
+    const trimmedLower = trimmed.toLowerCase();
+
+    // 跳过系统内部内容
+    if (trimmed.startsWith('{') || trimmed.startsWith('```') || trimmed.startsWith('"') ||
+        trimmed === '"' ||
+        trimmedLower.includes('conversation info') || trimmedLower.includes('timestamp') ||
+        trimmedLower.includes('sender') || trimmedLower.includes('message_id') ||
+        trimmedLower.includes('return your response as plain text')) {
       continue;
     }
-    
+
+    // 处理 [时间戳] 用户消息 格式：提取 ] 之后的内容
+    if (trimmed.startsWith('[') && trimmed.includes(']')) {
+      const bracketIdx = trimmed.indexOf(']');
+      const afterBracket = trimmed.slice(bracketIdx + 1).trim();
+      if (afterBracket.length > 0) {
+        candidates.push(afterBracket.replace(/[""]$/, '').slice(0, 80));
+        continue;
+      }
+    }
+
     if (!/[\u4e00-\u9fa5a-zA-Z]/.test(trimmed)) continue;
-    
+
     const colonIdx = trimmed.indexOf(':');
     if (colonIdx > 0 && colonIdx < 30) {
       const content = trimmed.slice(colonIdx + 1).trim();
       if (content.length > 0) {
-        return content.slice(0, 80);
+        candidates.push(content.slice(0, 80));
+        continue;
       }
     }
-    
-    return trimmed.slice(0, 80);
+
+    candidates.push(trimmed.slice(0, 80));
   }
-  
-  return '';
+
+  // 返回最后一个候选项（最近的用户消息）
+  return candidates.length > 0 ? candidates[candidates.length - 1] : '';
 }
 
-// ==================== L3 技能扫描 ====================
-function getL3SkillsDirect() {
+// ==================== 从 prompt 中提取模型回答 ====================
+function extractAssistantResponseFromPrompt(promptStr) {
+  if (!promptStr || typeof promptStr !== 'string') return null;
+  // 尝试在 END_OPENCLAW_INTERNAL_CONTEXT 之后查找 assistant 回答
+  const marker = '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>';
+  const markerIdx = promptStr.lastIndexOf(marker);
+  const searchStr = markerIdx >= 0 ? promptStr.slice(markerIdx + marker.length) : promptStr;
+  // 查找 "assistant:" 或 "Assistant:" 开头的行
+  const lines = searchStr.split('\n');
+  let lastAssistantLine = '';
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('assistant') || trimmed.startsWith('Assistant')) {
+      const colonIdx = trimmed.indexOf(':');
+      if (colonIdx > 0 && colonIdx < 20) {
+        lastAssistantLine = trimmed.slice(colonIdx + 1).trim();
+      }
+    }
+  }
+  if (lastAssistantLine) return lastAssistantLine.slice(0, 500);
+  return null;
+}
+
+// ==================== 获取所有卡片 ====================
+function getAllCards() {
+  const dataDir = getDataDir();
+  const cardsDir = join(dataDir, 'cards');
+  if (!existsSync(cardsDir)) return [];
+
+  const cards = [];
+  try {
+    const cardFiles = execSync(`find "${cardsDir}" -name "*.yaml" -maxdepth 1`, {
+      encoding: 'utf-8', timeout: 5000
+    }).trim().split('\n').filter(Boolean);
+
+    for (const cardPath of cardFiles) {
+      try {
+        const content = readFileSync(cardPath, 'utf-8');
+        const idM = content.match(/^id:\s*(\S+)/m);
+        const titleM = content.match(/^title:\s*"?([^"\n]+)"?/m);
+        const problemM = content.match(/^problem:\s*\|?\s*([^\n]+)/m);
+        const solutionM = content.match(/^solution:\s*\|?\s*([^\n]+)/m);
+        const levelM = content.match(/^level:\s*(\S+)/m);
+        const hitM = content.match(/^hit_count:\s*(\d+)/m);
+
+        cards.push({
+          id: idM ? idM[1] : '',
+          title: titleM ? titleM[1] : '',
+          problem: problemM ? problemM[1].replace(/^[^a-zA-Z0-9\u4e00-\u9fa5]+/, '') : '',
+          solution: solutionM ? solutionM[1].replace(/^[^a-zA-Z0-9\u4e00-\u9fa5]+/, '') : '',
+          level: levelM ? levelM[1] : 'L1',
+          hit_count: hitM ? parseInt(hitM[1]) : 0
+        });
+      } catch(e) {}
+    }
+  } catch(e) {}
+  return cards;
+}
+
+// ==================== 有脚本的技能扫描（简化版：不再区分L3） ====================
+function getSkillsWithScripts() {
   const dataDir = getDataDir();
   const cardsDir = join(dataDir, 'cards');
   const skillsDir = join(dataDir, 'skills');
@@ -266,9 +1762,8 @@ function getL3SkillsDirect() {
     for (const cardPath of cardFiles) {
       try {
         const content = readFileSync(cardPath, 'utf-8');
-        const levelM = content.match(/^level:\s*(\S+)/m);
-        if (!levelM || levelM[1] !== 'L3') continue;
 
+        // 简化版：不再检查 level，只要有 skill_script 就认为是可执行技能
         const scriptM = content.match(/^skill_script:\s*"?([^"\n]+)"?/m);
         if (!scriptM || !scriptM[1]) continue;
 
@@ -277,12 +1772,6 @@ function getL3SkillsDirect() {
 
         const scriptName = scriptM[1];
         const scriptPath = join(skillsDir, scriptName);
-
-        // 跳过模板脚本
-        if (existsSync(scriptPath)) {
-          const sc = readFileSync(scriptPath, 'utf-8');
-          if (sc.includes('auto-generated')) continue;
-        }
 
         if (!existsSync(scriptPath)) continue;
 
@@ -399,35 +1888,8 @@ function extractLastError(messages) {
   return null;
 }
 
-// ==================== 模板提示限频 ====================
-const TEMPLATE_PROMPT_FILE = join(process.env.HOME || '/root', '.openclaw', '.auto-skill', '.template-prompt-state');
-
-function shouldPromptTemplate() {
-  try {
-    if (!existsSync(TEMPLATE_PROMPT_FILE)) return true;
-    const data = JSON.parse(readFileSync(TEMPLATE_PROMPT_FILE, 'utf-8'));
-    const today = new Date().toISOString().slice(0, 10);
-    if (data.date !== today) return true;
-    return (data.count || 0) < 3;
-  } catch {
-    return true;
-  }
-}
-
-function recordTemplatePrompt() {
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-    let data = { date: today, count: 0 };
-    try {
-      if (existsSync(TEMPLATE_PROMPT_FILE)) {
-        data = JSON.parse(readFileSync(TEMPLATE_PROMPT_FILE, 'utf-8'));
-        if (data.date !== today) data = { date: today, count: 0 };
-      }
-    } catch {}
-    data.count = (data.count || 0) + 1;
-    writeFileSync(TEMPLATE_PROMPT_FILE, JSON.stringify(data));
-  } catch {}
-}
+// ==================== 模板提示 ====================
+// 模板脚本优化由模型判断是否需要，不再硬编码限流
 
 // ==================== 主逻辑 ====================
 module.exports = {
@@ -435,41 +1897,317 @@ module.exports = {
     console.log("[DEBUG] rocky-auto-skill register called, hooks:", Object.keys(api));
     autoInstall();
     console.log('[DEBUG] autoInstall check done');
+
+    // 启动每日沉寂扫描定时器（每小时检查一次）
+    setInterval(() => {
+      dailyDecayScan().catch(e => console.log('[DEBUG] daily scan error:', e.message));
+    }, 60 * 60 * 1000);
+    // 启动时立即执行一次
+    dailyDecayScan().catch(e => console.log('[DEBUG] daily scan initial error:', e.message));
+
     api.on('before_agent_start', (event) => {
+      console.log("[DEBUG] HOOK FIRING, event keys:", Object.keys(event || {}));
+      let result = null;
       try {
-      console.log("[DEBUG] before_agent_start triggered");
       const scriptsDir = getScriptsDir();
-      console.log("[DEBUG] scriptsDir:", scriptsDir);
-      if (!existsSync(scriptsDir)) { console.log("[DEBUG] scriptsDir not found, return"); return; }
+      if (!existsSync(scriptsDir)) { return result || {}; }
 
       const dataDir = getDataDir();
       const skillsDir = join(dataDir, 'skills');
+      const cardsDir = join(dataDir, 'cards');
 
       refreshCache();
 
-      const result = {
-        prependSystemContext: `💡 经验系统：遇问题搜经验 python3 ${scriptsDir}/autoskill-search "关键词"，解决后记录 bash ${scriptsDir}/autoskill-record --title "标题" --tool "工具" --problem "问题" --solution "方案"`
+      result = {
+        prependSystemContext: `💡 经验系统：遇问题搜经验 python3 ${scriptsDir}/autoskill-search "关键词"，解决后记录 bash ${scriptsDir}/autoskill-record --title "标题" --tool "工具" --problem "问题" --solution "方案"
+
+🔧 技能改进：执行脚本后如果结果不完整、有错误、或者发现更好的方法，立即用 python3 ${scriptsDir}/autoskill-enhance 改进脚本。不要等到用户说"不对"才改。发现技能过时或有问题时，主动更新。`
       };
 
       // ========== 触发条件：检测到错误 或 用户消息 ==========
       const errorMsg = extractLastError(event.messages || []);
       const userMsgStr = typeof event.prompt === 'string' ? event.prompt : '';
+      console.log("[DEBUG] userMsgStr length:", userMsgStr.length, "prompt slice:", userMsgStr.slice(-100));
       const userMsg = extractUserMessageKeywordsFromPrompt(userMsgStr);
-      console.log("[DEBUG] extracted userMsg:", userMsg, "len:", userMsg ? userMsg.length : 0);
-      
-      // 两种触发方式都收集 L3 脚本
-      const allL3Scripts = [];
-      const triggerInfo = [];
+      console.log("[DEBUG] extracted userMsg:", JSON.stringify(userMsg), "len:", userMsg.length);
+
+      // ========== 自然语言意图检测 ==========
+      // ---------- 记录意图 ----------
+      const recordIntentPatterns = [
+        /^\s*(帮我)?记录(一个)?经验/,
+        /^\s*记一下/,
+        /^\s*备忘/,
+        /^\s*把这个记下来/,
+        /^\s*记录一下/,
+        /^\s*我要记录/,
+        /^\s*想记录/,
+        /^\s*记个/,
+        /^\s*记笔记/,
+        /^\s*收藏/,
+        /^\s*抄下来/,
+        /^\s*存档/
+      ];
+      const hasRecordIntent = recordIntentPatterns.some(p => p.test(userMsg));
+
+      // ---------- 统计意图 ----------
+      const statsIntentPatterns = [
+        /^\s*(帮我)?查看?统计/,
+        /^\s*统计(一下)?/,
+        /^\s*状态/,
+        /^\s*情况/,
+        /^\s*看看.*情况/,
+        /^\s*有什么/,
+        /^\s*查看/,
+        /^\s*查看经验/,
+        /^\s*经验列表/
+      ];
+      const hasStatsIntent = statsIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
+
+      // ---------- 列表意图 ----------
+      const listIntentPatterns = [
+        /^\s*(帮我)?列出(所有)?经验/,
+        /^\s*列表/,
+        /^\s*经验列表/,
+        /^\s*所有经验/,
+        /^\s*有哪些/,
+        /^\s*看看列表/
+      ];
+      const hasListIntent = listIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
+
+      // ---------- 搜索意图 ----------
+      const searchMatch = userMsg.match(/^(搜索|找|查找|查询)\s*(.+)/);
+
+      // ---------- 命中意图 ----------
+      const hitIntentPatterns = [
+        /^\s*(这个)?有用/,
+        /^\s*(帮我)?标记.*有用/,
+        /^\s*(帮我)?标记/,
+        /^\s*hit/,
+        /^\s*点赞/,
+        /^\s*喜欢/,
+        /^\s*收藏/,
+        /^\s*记住了/
+      ];
+      const hasHitIntent = hitIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
+
+      // ---------- 回滚意图 ----------
+      const rollbackIntentPatterns = [
+        /^\s*回到上一个版本/,
+        /^\s*撤销/,
+        /^\s*回滚/,
+        /^\s*恢复上一版/,
+        /^\s*取消.*修改/,
+        /^\s*不对.*取消/
+      ];
+      const hasRollbackIntent = rollbackIntentPatterns.some(p => p.test(userMsg));
+
+      // ---------- 反馈意图 ----------
+      // 上下文相关的脚本修改（无需明确命令，根据对话上下文隐式判断）
+      // 只要消息与当前执行的技能相关，且包含"增加"、"加"、"还要"等词，就触发脚本修改
+
+      // ========== 执行自然语言命令 ==========
+      try {
+        // ----- 记录意图 -----
+        if (hasRecordIntent) {
+          console.log('[DEBUG] natural language record intent detected:', userMsg.slice(0, 50));
+          let extractedTitle = userMsg;
+          let extractedProblem = userMsg;
+          let extractedSolution = '待补充';
+
+          const colonMatch = userMsg.match(/[：:]\s*(.+)/);
+          if (colonMatch) {
+            const content = colonMatch[1].trim();
+            if (content.includes('，') || content.includes(',')) {
+              const parts = content.split(/[，,]/);
+              extractedTitle = parts[0].trim();
+              extractedProblem = content.trim();
+              if (parts[1] && parts[1].trim() !== '') {
+                extractedSolution = parts[1].trim();
+              }
+            } else {
+              extractedTitle = content.slice(0, 20);
+              extractedProblem = content;
+            }
+          }
+
+          const safeTitle = extractedTitle.replace(/[#*`$\\]/g, '').slice(0, 50);
+          const safeProblem = extractedProblem.replace(/[#*`$\\]/g, '').slice(0, 500);
+          const safeSolution = extractedSolution.replace(/[#*`$\\]/g, '').slice(0, 500);
+          const recordCmd = `bash "${scriptsDir}/autoskill-record" --title "${safeTitle}" --tool "qq" --problem "${safeProblem}" --solution "${safeSolution}" 2>&1`;
+          console.log('[DEBUG] natural record cmd:', recordCmd.slice(0, 100));
+          const recordOutput = execSync(recordCmd, { encoding: 'utf-8', timeout: 10000 });
+          console.log('[DEBUG] natural record output:', recordOutput.slice(0, 200));
+
+          result.prependContext = `✅ 已记录经验卡片：
+📌 标题：${safeTitle}
+📋 问题：${safeProblem.slice(0, 50)}${safeProblem.length > 50 ? '...' : ''}
+🔧 方案：${safeSolution}
+
+卡片ID：${recordOutput.match(/id:\s*(\d+)/)?.[1] || '未知'}
+
+---
+`;
+          cache.ts = 0;
+        }
+        // ----- 统计意图 -----
+        else if (hasStatsIntent) {
+          console.log('[DEBUG] natural language stats intent detected:', userMsg.slice(0, 50));
+          const statsCmd = `bash "${scriptsDir}/autoskill-stats" 2>&1`;
+          const statsOutput = execSync(statsCmd, { encoding: 'utf-8', timeout: 10000 });
+          result.prependContext = `📊 经验统计：
+${statsOutput}
+
+---
+`;
+        }
+        // ----- 列表意图 -----
+        else if (hasListIntent) {
+          console.log('[DEBUG] natural language list intent detected:', userMsg.slice(0, 50));
+          const listCmd = `bash "${scriptsDir}/autoskill-list" 2>&1`;
+          const listOutput = execSync(listCmd, { encoding: 'utf-8', timeout: 10000 });
+          result.prependContext = `📋 经验列表：
+${listOutput}
+
+---
+`;
+        }
+        // ----- 搜索意图 -----
+        else if (searchMatch) {
+          const keyword = searchMatch[2].trim();
+          console.log('[DEBUG] natural language search intent detected:', keyword);
+          const searchCmd = `bash "${scriptsDir}/autoskill-search" "${keyword}" 2>&1`;
+          const searchOutput = execSync(searchCmd, { encoding: 'utf-8', timeout: 10000 });
+          result.prependContext = `🔍 搜索"${keyword}"结果：
+${searchOutput}
+
+---
+`;
+        }
+        // ----- 命中意图 -----
+        else if (hasHitIntent) {
+          console.log('[DEBUG] natural language hit intent detected:', userMsg.slice(0, 50));
+          // 获取最新创建的卡片ID
+          const listCmd = `bash "${scriptsDir}/autoskill-list" 2>&1`;
+          const listOutput = execSync(listCmd, { encoding: 'utf-8', timeout: 10000 });
+          const idMatch = listOutput.match(/ID:\s*(\d+)/);
+          if (idMatch) {
+            const cardId = idMatch[1];
+            const hitCmd = `bash "${scriptsDir}/autoskill-hit" ${cardId} 2>&1`;
+            const hitOutput = execSync(hitCmd, { encoding: 'utf-8', timeout: 10000 });
+            result.prependContext = `👍 已标记卡片 #${cardId} 为有用！
+${hitOutput}
+
+---
+`;
+            cache.ts = 0;
+          }
+        }
+        // ----- 回滚意图 -----
+        else if (hasRollbackIntent) {
+          console.log('[DEBUG] natural language rollback intent detected:', userMsg.slice(0, 50));
+          console.log('[DEBUG] lastExecutedSkill check:', lastExecutedSkill ? `${lastExecutedSkill.cardId} ${lastExecutedSkill.title}` : 'NULL');
+          // 获取当前执行的技能路径（如果有）
+          if (lastExecutedSkill && lastExecutedSkill.scriptPath) {
+            console.log('[DEBUG] rollback: calling rollbackScript with path:', lastExecutedSkill.scriptPath);
+            const rollbackResult = rollbackScript(lastExecutedSkill.scriptPath);
+            console.log('[DEBUG] rollbackResult:', JSON.stringify(rollbackResult));
+            if (rollbackResult.success) {
+              result.prependContext = `🔄 ${rollbackResult.message}
+📌 技能：${lastExecutedSkill.title}
+
+脚本已恢复到版本 #${rollbackResult.version}，下次执行会使用该版本~
+
+---
+`;
+              logSkillImprovement(lastExecutedSkill.cardId, 'rollback', {
+                fromVersion: 'current',
+                toVersion: rollbackResult.version
+              });
+              cache.ts = 0;
+            } else {
+              result.prependContext = `⚠️ ${rollbackResult.message}
+
+---
+`;
+            }
+          } else {
+            result.prependContext = `⚠️ 没有可回滚的技能记录
+
+---
+`;
+          }
+        }
+      } catch(e) {
+        console.log('[DEBUG] natural language command error:', e.message);
+      }
+
+      // ========== 反馈意图检测：用户说"不对"、"应该还要"等 = 触发脚本优化 ==========
+      // ========== 上下文感知的脚本修改（Hermes式） ==========
+      // 只在非回滚意图时检测上下文修改，避免 Python 调用失败影响回滚流程
+      let contextModify = null;
+      if (!hasRollbackIntent) {
+        contextModify = detectContextScriptModification(userMsg, event.messages || [], lastExecutedSkill, scriptsDir, skillsDir);
+      }
+      if (contextModify) {
+        console.log('[DEBUG] context script modification detected:', contextModify.reason);
+        try {
+          const { cardId, scriptPath, title, currentScript, enhancement } = contextModify;
+
+          // 生成增强后的脚本
+          const newScript = applyScriptEnhancement(title, currentScript, enhancement);
+          if (newScript && newScript !== currentScript) {
+            // 更新前先备份当前版本
+            backupScript(scriptPath);
+
+            writeFileSync(scriptPath, newScript, 'utf-8');
+            chmodSync(scriptPath, 0o755);
+
+            // 记录改进日志
+            logSkillImprovement(cardId, 'context_enhancement', {
+              enhancement: enhancement,
+              scriptPath: scriptPath
+            });
+
+            console.log('[DEBUG] context script updated for card:', cardId, 'enhancement:', enhancement);
+
+            result.prependContext = `🔧 已根据上下文自动增强技能脚本：
+📌 技能：${title}
+💡 增强：${enhancement}
+
+脚本已更新，下次执行会使用增强版本~ 如需回滚，说"回到上一个版本"
+
+---
+`;
+            cache.ts = 0;
+          }
+        } catch(e) {
+          console.log('[DEBUG] context modification error:', e.message);
+        }
+      }
+
+      // ========== 工作流模式检测（模型分析） ==========
+      const sessionKey = event.sessionKey || 'default';
+      // 将消息历史发送给模型判断
+      processWorkflow(sessionKey, event.messages || [], dataDir).then(workflow => {
+        if (workflow) {
+          console.log('[DEBUG] workflow: generated by model:', workflow.workflowId, workflow.title);
+        }
+      }).catch(e => {
+        console.log('[DEBUG] workflow: process error:', e.message);
+      });
 
       // 方式1：错误触发
+      const matchedScripts = [];
+      const triggerInfo = [];
+
       if (errorMsg) {
         const keyword = extractErrorKeywords(errorMsg);
         const searchResults = searchCards(scriptsDir, keyword);
         if (searchResults && searchResults.length > 0) {
-          const l3Scripts = searchResults.filter(r => r.level === 'L3' && r.skill_script);
-          l3Scripts.forEach(r => {
-            if (!allL3Scripts.some(s => s.id === r.id)) {
-              allL3Scripts.push({ ...r, trigger: 'error', keyword });
+          const matchingScripts = searchResults.filter(r => r.skill_script);
+          matchingScripts.forEach(r => {
+            if (!matchedScripts.some(s => s.id === r.id)) {
+              matchedScripts.push({ ...r, trigger: 'error', keyword });
               triggerInfo.push(`🔴 错误触发: "${keyword}"`);
             }
           });
@@ -477,10 +2215,26 @@ module.exports = {
       }
 
       // 方式2：用户消息触发（关键词匹配）
-      console.log("[DEBUG] userMsg check:", userMsg, userMsg.length, cache.l3Skills ? cache.l3Skills.length : 'no cache');
       if (userMsg && userMsg.length > 2) { // 中文3字符起触发（兼容短查询）
-        // 从 L3 技能库中匹配
-        const matched = cache.l3Skills.filter(s => {
+        // 从所有卡片中匹配（用于 hit 累计）
+        const allCards = getAllCards();
+        const matchedAll = allCards.filter(c => {
+          const title = (c.title || '').toLowerCase();
+          const problem = (c.problem || '').toLowerCase();
+          const userLower = userMsg.toLowerCase();
+          const titleStr = Array.isArray(title) ? title.join(' ') : title;
+          const problemStr = Array.isArray(problem) ? problem.join(' ') : problem;
+          return titleStr.includes(userLower) || problemStr.includes(userLower);
+        });
+
+        // 简化版：不再追踪 hit_count，不再自动晋升
+        // 模型根据上下文自行决定如何处理匹配到的技能
+        matchedAll.forEach(c => {
+          console.log('[DEBUG] matched skill:', c.id, c.title, 'hasScript:', !!c.skill_script);
+        });
+
+        // 从有脚本的技能库中匹配
+        const matched = cache.skillsWithScripts.filter(s => {
           const title = (s.title || '').toLowerCase();
           const problem = (s.problem || '').toLowerCase();
           const userLower = userMsg.toLowerCase();
@@ -490,33 +2244,58 @@ module.exports = {
           // 检查用户消息是否包含技能标题或问题的关键词
           return titleStr.includes(userLower) || problemStr.includes(userLower);
         });
-        
-        console.log("[DEBUG] matched L3 skills:", matched.length, matched.map(s=>s.title));
+
         matched.forEach(s => {
-          if (!allL3Scripts.some(s2 => s2.id === s.id)) {
-            allL3Scripts.push({ ...s, trigger: 'user', keyword: userMsg });
+          if (!matchedScripts.some(s2 => s2.id === s.id)) {
+            matchedScripts.push({ ...s, trigger: 'user', keyword: userMsg });
             triggerInfo.push(`🟡 用户消息: "${userMsg.slice(0, 30)}..."`);
           }
         });
-        console.log("[DEBUG] allL3Scripts after userMsg:", allL3Scripts.length);
+
+        console.log('[DEBUG] skill match check: matched count:', matched.length, 'matchedScripts:', matchedScripts.length, matchedScripts.map(s=>s.id));
+
+        // 如果没有匹配到任何技能，模型决定是否创建卡片
+        if (matched.length === 0) {
+          // 检查是否已存在相同问题的卡片
+          const existingCards = getAllCards();
+          const alreadyExists = existingCards.some(c => {
+            const cProblem = (c.problem || '').toLowerCase();
+            return cProblem === userMsg.toLowerCase() || cProblem.includes(userMsg.toLowerCase()) || userMsg.toLowerCase().includes(cProblem);
+          });
+
+          if (alreadyExists) {
+            console.log('[DEBUG] card already exists, skip auto-create');
+          } else {
+            const decision = askModelDecision('create_card', { userMsg });
+            if (decision.decision === 'yes') {
+              try {
+                const safeTitle = (decision.title || userMsg.slice(0, 30)).replace(/[^a-zA-Z0-9\u4e00-\u9fa5]/g, '-');
+                const recordCmd = `bash "${scriptsDir}/autoskill-record" --title "${safeTitle}" --tool "ai" --problem "${userMsg}" --solution "待补充" 2>&1`;
+                const recordOutput = execSync(recordCmd, { encoding: 'utf-8', timeout: 10000 });
+                console.log('[DEBUG] model-driven auto-created card:', decision.reason, recordOutput.slice(0, 100));
+                cache.ts = 0;
+              } catch(e) {
+                console.log('[DEBUG] auto-create failed:', e.message);
+              }
+            }
+          }
+        }
       }
 
-      // 执行 L3 脚本（根据成功率决定）
-      if (allL3Scripts.length > 0) {
+      // 执行匹配的脚本
+      if (matchedScripts.length > 0) {
         const execResults = [];
         const modelCheckSkills = [];  // 成功率不足90%，交给模型
 
-        console.log("[DEBUG] allL3Scripts details:", JSON.stringify(allL3Scripts.map(r=>({id:r.id, title:r.title, skill_script:r.skill_script}))));
-      for (const r of allL3Scripts) {
+      for (const r of matchedScripts) {
           const scriptPath = join(skillsDir, r.skill_script);
-          console.log("[DEBUG] scriptPath:", scriptPath, existsSync(scriptPath) ? 'exists' : 'NOT FOUND');
-          console.log("[DEBUG] r.id:", r.id, "r.skill_script:", r.skill_script);
+          console.log('[DEBUG] script loop:', r.id, 'scriptPath:', scriptPath, 'exists:', existsSync(scriptPath));
           if (!existsSync(scriptPath)) continue;
 
           // 跳过模板脚本
           try {
             const sc = readFileSync(scriptPath, 'utf-8');
-            if (sc.includes('auto-generated')) continue;
+            if (sc.includes('auto-generated')) { console.log('[DEBUG] skipping auto-generated script:', scriptPath); continue; }
           } catch {}
 
           // 检查成功率
@@ -530,9 +2309,9 @@ module.exports = {
           }
 
           // 自动执行脚本
-          console.log("[DEBUG] autoExecuteScript:", scriptPath);
+          console.log('[DEBUG] autoExecuteScript for:', r.id, scriptPath);
           const execResult = autoExecuteScript(scriptPath, r.id, r.title);
-          console.log("[DEBUG] execResult:", execResult.success, execResult.stdout ? execResult.stdout.slice(0,100) : 'none');
+          console.log('[DEBUG] execResult:', JSON.stringify(execResult));
           execResults.push({
             id: r.id,
             title: r.title,
@@ -540,6 +2319,17 @@ module.exports = {
             trigger: r.trigger,
             ...execResult
           });
+
+          // 记录最近执行的技能（用于反馈优化）
+          const currentScript = existsSync(scriptPath) ? readFileSync(scriptPath, 'utf-8') : '';
+          setLastExecutedSkill(r.id, scriptPath, r.title, currentScript);
+
+          // 自动分析执行结果，决定是否优化脚本（异步，不阻塞）
+          if (execResult.success) {
+            analyzeAndOptimizeScript(r.id, scriptPath, r.title, execResult.stdout).catch(e => {
+              console.log('[DEBUG] analyzeAndOptimize error:', e.message);
+            });
+          }
 
           // 记录执行结果（方案E）
           try {
@@ -551,8 +2341,9 @@ module.exports = {
         }
 
         // 构建 context
+        console.log('[DEBUG] building prepend: matchedScripts:', matchedScripts.length, 'execResults:', execResults.length);
         const uniqueTriggers = [...new Set(triggerInfo)].slice(0, 3);
-        let prepend = `🔍 auto-skill 检测到 ${allL3Scripts.length} 条相关经验:
+        let prepend = `🔍 auto-skill 检测到 ${matchedScripts.length} 条相关经验:
 `;
         prepend += uniqueTriggers.join('\n') + '\n\n';
 
@@ -590,24 +2381,12 @@ module.exports = {
         result.prependContext = prepend;
       }
 
-      // ========== 模板脚本优化提示（限频）==========
-      const templates = cache.templates;
-      if (templates.length > 0 && shouldPromptTemplate()) {
-        const tip = templates.slice(0, 3).map(t =>
-          `📝 [${t.id}] "${t.title}" → ${t.scriptPath}\n   问题: ${t.problem}\n   方案: ${t.solution}`
-        ).join('\n');
-
-        const ctx = result.prependContext || '';
-        result.prependContext = ctx + (ctx ? '\n\n' : '') +
-          `🔧 ${templates.length} 个模板脚本待优化（删除 auto-generated 标记后生效）：\n${tip}`;
-        recordTemplatePrompt();
-      }
       } catch(e) {
         console.log("[DEBUG] HOOK ERROR:", e.message, e.stack);
-        return;
+        return result || {};
       }
 
-      return result;
+      return result || {};
     });
   }
 };

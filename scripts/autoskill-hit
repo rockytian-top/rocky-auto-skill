@@ -1,0 +1,147 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v2.1.0
+# autoskill-hit - 标记命中（计数+1，检查晋升）
+# =============================================================================
+set -euo pipefail
+
+# 根据 OPENCLAW_STATE_DIR 自动选择数据目录（与 index.js 一致）
+_get_data_dir() {
+  if [ -n "${AUTOSKILL_DIR:-}" ]; then
+    echo "$AUTOSKILL_DIR"
+  elif [ -n "$OPENCLAW_STATE_DIR" ]; then
+    echo "$OPENCLAW_STATE_DIR/.auto-skill"
+  else
+    echo "$HOME/.openclaw/.auto-skill"
+  fi
+}
+DATA_DIR="$(_get_data_dir)"
+CARDS_DIR="$DATA_DIR/cards"
+SKILLS_DIR="$DATA_DIR/skills"
+
+# 用法
+usage() {
+  cat << 'EOF'
+用法: autoskill-hit <id> [--confirm] [--invalid]
+
+参数:
+  <id>       卡片ID（如 001 或 1）
+
+选项:
+  --confirm  确认复用成功（默认）
+  --invalid  标记方案无效（卡片标记为 expired）
+EOF
+}
+
+ID=""
+ACTION="confirm"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --confirm)  ACTION="confirm"; shift ;;
+    --invalid)  ACTION="invalid"; shift ;;
+    --help|-h)  usage; exit 0 ;;
+    *)          ID="$1"; shift ;;
+  esac
+done
+
+# 格式化 ID
+if [ -z "$ID" ]; then
+  echo "❌ 请提供卡片ID"
+  usage
+  exit 1
+fi
+
+# 补零（强制十进制，避免八进制解析）
+ID_raw=$((10#$ID))
+ID=$(printf '%03d' "$ID_raw" 2>/dev/null || echo "$ID")
+
+# 找到卡片文件
+CARD_FILE=""
+for f in "$CARDS_DIR"/*.yaml; do
+  [ -f "$f" ] || continue
+  f_id=$(grep "^id:" "$f" | awk '{print $2}')
+  if [ "$f_id" = "$ID" ]; then
+    CARD_FILE="$f"
+    break
+  fi
+done
+
+if [ -z "$CARD_FILE" ]; then
+  echo "❌ 找不到卡片 ID: $ID"
+  exit 1
+fi
+
+TODAY=$(date +%Y-%m-%d)
+
+# 读取当前值
+current_level=$(grep "^level:" "$CARD_FILE" | awk '{print $2}')
+current_hits=$(grep "^hit_count:" "$CARD_FILE" | awk '{print $2}')
+current_status=$(grep "^status:" "$CARD_FILE" | awk '{print $2}')
+
+if [ "$ACTION" = "invalid" ]; then
+  # 标记方案无效
+  sed -i '' "s/^status: .*/status: expired/" "$CARD_FILE"
+  sed -i '' "s/^updated_at: .*/updated_at: $TODAY/" "$CARD_FILE"
+  echo "⚠️ 卡片 [$ID] 已标记为 expired（方案无效）"
+  exit 0
+fi
+
+# 确认复用成功
+new_hits=$((current_hits + 1))
+
+# 更新计数和时间
+sed -i '' "s/^hit_count: .*/hit_count: $new_hits/" "$CARD_FILE"
+sed -i '' "s/^last_hit_at: .*/last_hit_at: $TODAY/" "$CARD_FILE"
+sed -i '' "s/^updated_at: .*/updated_at: $TODAY/" "$CARD_FILE"
+
+# 如果是 review 状态，恢复为 active
+if [ "$current_status" = "review" ]; then
+  sed -i '' "s/^status: .*/status: active/" "$CARD_FILE"
+  echo "📋 卡片 [$ID] 从 review 恢复为 active"
+fi
+
+echo "✅ 卡片 [$ID] 命中计数: $current_hits → $new_hits"
+
+# 检查晋升
+check_promotion() {
+  local level=$1
+  local hits=$2
+  local card_file=$3
+  local card_id=$4
+  
+  case "$level" in
+    L1)
+      if [ "$hits" -ge 3 ]; then
+        sed -i '' "s/^level: .*/level: L2/" "$card_file"
+        echo "🎉 卡片 [$card_id] 晋升: 🟡 L1 → 🟠 L2（已验证${hits}次）"
+      fi
+      ;;
+    L2)
+      if [ "$hits" -ge 5 ]; then
+        # 检查是否已有 L3 脚本
+        local script_name
+        script_name="$(basename "$card_file" .yaml).sh"
+        if [ -f "$SKILLS_DIR/$script_name" ]; then
+          # 已有脚本，直接晋升
+          sed -i '' "s/^level: .*/level: L3/" "$card_file"
+          sed -i '' "s/^source: .*/source: auto/" "$card_file"
+          echo "🎉 卡片 [$card_id] 晋升: 🟠 L2 → 🔴 L3（自动技能）"
+          echo "🤖 脚本已就绪: $SKILLS_DIR/$script_name"
+        else
+          # 没有脚本，先暂停在 L2 并提示
+          echo "⚠️ 卡片 [$card_id] 已达 L3 条件（${hits}次命中），但缺少脚本"
+          echo "   生成脚本后再 hit 一次即可自动晋升："
+          echo "   1. 读取 $card_file 的 solution 内容"
+          echo "   2. 生成脚本保存到 $SKILLS_DIR/$script_name"
+          echo "   3. 再次执行 autoskill-hit $card_id（自动检测脚本并晋升）"
+        fi
+      fi
+      ;;
+    L3)
+      echo "🔴 L3 技能已就绪，自动执行"
+      ;;
+  esac
+}
+
+check_promotion "$current_level" "$new_hits" "$CARD_FILE" "$ID"

@@ -1,0 +1,183 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v2.1.0
+# autoskill-record - 记录一条经验卡片（L1）
+# =============================================================================
+set -euo pipefail
+
+# 根据 OPENCLAW_STATE_DIR 自动选择数据目录（与 index.js 一致）
+_get_data_dir() {
+  if [ -n "${AUTOSKILL_DIR:-}" ]; then
+    echo "$AUTOSKILL_DIR"
+  elif [ -n "$OPENCLAW_STATE_DIR" ]; then
+    echo "$OPENCLAW_STATE_DIR/.auto-skill"
+  else
+    echo "$HOME/.openclaw/.auto-skill"
+  fi
+}
+DATA_DIR="$(_get_data_dir)"
+CARDS_DIR="$DATA_DIR/cards"
+INDEX_FILE="$DATA_DIR/INDEX.md"
+
+# 获取下一个 ID
+next_id() {
+  local max_id=0
+  if [ -d "$CARDS_DIR" ] && ls "$CARDS_DIR"/*.yaml 2>/dev/null | head -1 | grep -q .; then
+    for f in "$CARDS_DIR"/*.yaml; do
+      local fid
+      fid=$(basename "$f" | sed 's/^\([0-9]*\)-.*/\1/')
+      # 去掉前导零，避免八进制解析错误
+      fid=$(echo "$fid" | sed 's/^0*//')
+      fid=${fid:-0}
+      if [ "$fid" -gt "$max_id" ] 2>/dev/null; then
+        max_id=$fid
+      fi
+    done
+  fi
+  echo $((max_id + 1))
+}
+
+# 生成 slug
+to_slug() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
+# 用法
+usage() {
+  cat << 'EOF'
+用法: autoskill-record --title "标题" --tool "工具名" [--tags "tag1,tag2"] --problem "问题描述" --solution "解决方案" [--root-cause "根因"] [--commands "相关命令"] [--category "config|deploy|network|service"]
+
+必填参数:
+  --title      卡片标题
+  --tool       关联工具/平台（如 hermes, napcat, openclaw）
+  --problem    问题描述
+  --solution   解决方案
+
+可选参数:
+  --tags       分类标签，逗号分隔（默认从 tool 自动生成）
+  --root-cause 根因分析
+  --commands   相关命令
+  --category   大类：config/deploy/network/service（默认: config）
+EOF
+}
+
+# 解析参数
+TITLE=""
+TOOL=""
+TAGS=""
+PROBLEM=""
+ROOT_CAUSE=""
+SOLUTION=""
+COMMANDS=""
+CATEGORY="config"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --title)      TITLE="$2"; shift 2 ;;
+    --tool)       TOOL="$2"; shift 2 ;;
+    --tags)       TAGS="$2"; shift 2 ;;
+    --problem)    PROBLEM="$2"; shift 2 ;;
+    --root-cause) ROOT_CAUSE="$2"; shift 2 ;;
+    --solution)   SOLUTION="$2"; shift 2 ;;
+    --commands)   COMMANDS="$2"; shift 2 ;;
+    --category)   CATEGORY="$2"; shift 2 ;;
+    --help|-h)    usage; exit 0 ;;
+    *)            echo "未知参数: $1"; usage; exit 1 ;;
+  esac
+done
+
+# 校验必填
+if [ -z "$TITLE" ] || [ -z "$TOOL" ] || [ -z "$PROBLEM" ] || [ -z "$SOLUTION" ]; then
+  echo "❌ 缺少必填参数！需要: --title, --tool, --problem, --solution"
+  usage
+  exit 1
+fi
+
+# 自动生成 tags
+if [ -z "$TAGS" ]; then
+  TAGS=$(to_slug "$TOOL")
+fi
+
+# 生成 ID 和文件名
+ID=$(next_id)
+SLUG=$(to_slug "$TITLE")
+CARD_FILE="$CARDS_DIR/$(printf '%03d' $ID)-${SLUG}.yaml"
+TODAY=$(date +%Y-%m-%d)
+
+# 写入 YAML
+cat > "$CARD_FILE" << YAMLEOF
+# rocky-auto-skill 经验卡片
+id: $(printf '%03d' $ID)
+title: "$TITLE"
+tool: $TOOL
+tags: [$TAGS]
+category: $CATEGORY
+
+level: L1
+hit_count: 0
+source: auto
+
+created_at: $TODAY
+last_hit_at: $TODAY
+updated_at: $TODAY
+status: active
+
+problem: |
+$(echo "$PROBLEM" | sed 's/^/  /')
+
+root_cause: |
+$(if [ -n "$ROOT_CAUSE" ]; then echo "$ROOT_CAUSE" | sed 's/^/  /'; else echo "  待补充"; fi)
+
+solution: |
+$(echo "$SOLUTION" | sed 's/^/  /')
+
+commands: |
+$(if [ -n "$COMMANDS" ]; then echo "$COMMANDS" | sed 's/^/  /'; else echo "  无"; fi)
+
+skill_script: ""
+skill_detect: ""
+skill_rollback: ""
+tool_version: ""
+YAMLEOF
+
+# 更新索引
+update_index() {
+  cat > "$INDEX_FILE" << 'IDXEOF'
+# rocky-auto-skill 索引
+# 按工具分类，自动生成
+
+IDXEOF
+  if ls "$CARDS_DIR"/*.yaml 2>/dev/null | head -1 | grep -q .; then
+    echo "" >> "$INDEX_FILE"
+    echo "## 按工具分类" >> "$INDEX_FILE"
+    # 收集所有 tool
+    local tools
+    tools=$(grep "^tool:" "$CARDS_DIR"/*.yaml | awk '{print $2}' | sort -u)
+    for t in $tools; do
+      echo "" >> "$INDEX_FILE"
+      echo "### $t" >> "$INDEX_FILE"
+      for f in "$CARDS_DIR"/*.yaml; do
+        local f_tool f_title f_level f_id
+        f_tool=$(grep "^tool:" "$f" | awk '{print $2}')
+        if [ "$f_tool" = "$t" ]; then
+          f_id=$(grep "^id:" "$f" | awk '{print $2}')
+          f_title=$(grep "^title:" "$f" | sed 's/title: *"\?\(.*\)"\?/\1/')
+          f_level=$(grep "^level:" "$f" | awk '{print $2}')
+          f_status=$(grep "^status:" "$f" | awk '{print $2}')
+          echo "- [$f_id] $f_title [$f_level] [$f_status]" >> "$INDEX_FILE"
+        fi
+      done
+    done
+  fi
+}
+
+update_index
+
+# 自动生成 embedding
+EMBED_SCRIPT="$(dirname "$0")/autoskill-embed"
+if [ -x "$EMBED_SCRIPT" ]; then
+  bash "$EMBED_SCRIPT" "$((10#$ID))" 2>/dev/null && echo "   🧠 embedding 已生成" || true
+fi
+
+echo "✅ 经验卡片已创建: $CARD_FILE"
+echo "   ID: $(printf '%03d' $ID) | Level: L1 | Tool: $TOOL"

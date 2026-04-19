@@ -1,0 +1,121 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v2.1.0
+# autoskill-promote - 手动晋升/降级
+# =============================================================================
+set -euo pipefail
+
+# 根据 OPENCLAW_STATE_DIR 自动选择数据目录（与 index.js 一致）
+_get_data_dir() {
+  if [ -n "${AUTOSKILL_DIR:-}" ]; then
+    echo "$AUTOSKILL_DIR"
+  elif [ -n "$OPENCLAW_STATE_DIR" ]; then
+    echo "$OPENCLAW_STATE_DIR/.auto-skill"
+  else
+    echo "$HOME/.openclaw/.auto-skill"
+  fi
+}
+DATA_DIR="$(_get_data_dir)"
+CARDS_DIR="$DATA_DIR/cards"
+SKILLS_DIR="$DATA_DIR/skills"
+
+usage() {
+  cat << 'EOF'
+用法: autoskill-promote <id> [--up] [--down] [--to L1|L2|L3]
+
+选项:
+  --up           晋升一级（L1→L2, L2→L3）
+  --down         降级一级（L3→L2, L2→L1）
+  --to <level>   直接指定级别
+EOF
+}
+
+ID=""
+ACTION="up"
+TARGET_LEVEL=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --up)      ACTION="up"; shift ;;
+    --down)    ACTION="down"; shift ;;
+    --to)      ACTION="to"; TARGET_LEVEL="$2"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *)         ID="$1"; shift ;;
+  esac
+done
+
+if [ -z "$ID" ]; then
+  echo "❌ 请提供卡片ID"
+  usage
+  exit 1
+fi
+
+ID=$((10#$ID))
+ID=$(printf '%03d' "$ID" 2>/dev/null || echo "$ID")
+
+# 找到卡片
+CARD_FILE=""
+for f in "$CARDS_DIR"/*.yaml; do
+  [ -f "$f" ] || continue
+  f_id=$(grep "^id:" "$f" | awk '{print $2}')
+  if [ "$f_id" = "$ID" ]; then
+    CARD_FILE="$f"
+    break
+  fi
+done
+
+if [ -z "$CARD_FILE" ]; then
+  echo "❌ 找不到卡片 ID: $ID"
+  exit 1
+fi
+
+current_level=$(grep "^level:" "$CARD_FILE" | awk '{print $2}')
+TODAY=$(date +%Y-%m-%d)
+
+case "$ACTION" in
+  up)
+    case "$current_level" in
+      L1) new_level="L2" ;;
+      L2)
+        base=$(basename "$CARD_FILE" .yaml)
+        if [ ! -f "$SKILLS_DIR/${base}.sh" ]; then
+          echo "❌ 晋升到 L3 需要脚本文件: $SKILLS_DIR/${base}.sh"
+          exit 1
+        fi
+        new_level="L3"
+        ;;
+      L3) echo "❌ 已经是最高级别 L3"; exit 0 ;;
+    esac
+    ;;
+  down)
+    case "$current_level" in
+      L1) echo "❌ 已经是最低级别 L1"; exit 0 ;;
+      L2) new_level="L1" ;;
+      L3) new_level="L2" ;;
+    esac
+    ;;
+  to)
+    if [ -z "$TARGET_LEVEL" ] || ! echo "L1 L2 L3" | grep -qw "$TARGET_LEVEL"; then
+      echo "❌ 无效级别: $TARGET_LEVEL（可选: L1, L2, L3）"
+      exit 1
+    fi
+    if [ "$TARGET_LEVEL" = "L3" ]; then
+      base=$(basename "$CARD_FILE" .yaml)
+      if [ ! -f "$SKILLS_DIR/${base}.sh" ]; then
+        echo "❌ 晋升到 L3 需要脚本文件: $SKILLS_DIR/${base}.sh"
+        echo "   请先生成脚本后再晋升"
+        exit 1
+      fi
+    fi
+    new_level="$TARGET_LEVEL"
+    ;;
+esac
+
+sed -i '' "s/^level: .*/level: $new_level/" "$CARD_FILE"
+sed -i '' "s/^updated_at: .*/updated_at: $TODAY/" "$CARD_FILE"
+
+# 旧 emoji 和新 emoji
+case "$current_level" in L1) old_e="🟡" ;; L2) old_e="🟠" ;; L3) old_e="🔴" ;; esac
+case "$new_level" in L1) new_e="🟡" ;; L2) new_e="🟠" ;; L3) new_e="🔴" ;; esac
+
+echo "✅ 卡片 [$ID]: $old_e $current_level → $new_e $new_level"

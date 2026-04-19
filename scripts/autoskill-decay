@@ -1,0 +1,184 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v2.1.0
+# autoskill-decay - 执行衰减扫描
+# =============================================================================
+set -euo pipefail
+
+# 根据 OPENCLAW_STATE_DIR 自动选择数据目录（与 index.js 一致）
+_get_data_dir() {
+  if [ -n "${AUTOSKILL_DIR:-}" ]; then
+    echo "$AUTOSKILL_DIR"
+  elif [ -n "$OPENCLAW_STATE_DIR" ]; then
+    echo "$OPENCLAW_STATE_DIR/.auto-skill"
+  else
+    echo "$HOME/.openclaw/.auto-skill"
+  fi
+}
+DATA_DIR="$(_get_data_dir)"
+CARDS_DIR="$DATA_DIR/cards"
+SKILLS_DIR="$DATA_DIR/skills"
+LOG_FILE="$DATA_DIR/logs/decay.log"
+
+TODAY=$(date +%Y-%m-%d)
+NOW_EPOCH=$(date +%s)
+
+# 衰减参数（天）
+L3_DECAY_DAYS=90
+L2_DECAY_DAYS=60
+L1_DECAY_DAYS=30
+L3_EXPIRE_DAYS=180
+L2_EXPIRE_DAYS=120
+L1_EXPIRE_DAYS=30
+REVIEW_DAYS=365
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+# 检查有没有卡片
+if ! ls "$CARDS_DIR"/*.yaml 2>/dev/null | head -1 | grep -q .; then
+  log "没有卡片需要扫描"
+  exit 0
+fi
+
+log "========== 衰减扫描开始 =========="
+
+demoted=0
+deleted=0
+reviewed=0
+skills_removed=0
+
+for f in "$CARDS_DIR"/*.yaml; do
+  [ -f "$f" ] || continue
+  
+  f_id=$(grep "^id:" "$f" | awk '{print $2}')
+  f_level=$(grep "^level:" "$f" | awk '{print $2}')
+  f_status=$(grep "^status:" "$f" | awk '{print $2}')
+  f_last=$(grep "^last_hit_at:" "$f" | awk '{print $2}')
+  f_created=$(grep "^created_at:" "$f" | awk '{print $2}')
+  f_title=$(grep "^title:" "$f" | sed 's/title: *"\?\(.*\)"\?/\1/')
+  
+  # 跳过已失效的
+  [ "$f_status" = "expired" ] && continue
+  
+  # 计算天数（从 last_hit_at）
+  if [ -n "$f_last" ] && [ "$f_last" != "" ]; then
+    last_epoch=$(date -j -f "%Y-%m-%d" "$f_last" "+%s" 2>/dev/null || echo "$NOW_EPOCH")
+    idle_days=$(( (NOW_EPOCH - last_epoch) / 86400 ))
+  else
+    idle_days=999
+  fi
+  
+  # 计算创建天数（从 created_at）
+  if [ -n "$f_created" ] && [ "$f_created" != "" ]; then
+    created_epoch=$(date -j -f "%Y-%m-%d" "$f_created" "+%s" 2>/dev/null || echo "$NOW_EPOCH")
+    age_days=$(( (NOW_EPOCH - created_epoch) / 86400 ))
+  else
+    age_days=0
+  fi
+  
+  # 365天过期审查
+  if [ "$age_days" -ge "$REVIEW_DAYS" ] && [ "$f_status" = "active" ]; then
+    sed -i '' "s/^status: .*/status: review/" "$f"
+    log "📋 [$f_id] $f_title → review（已创建 ${age_days} 天）"
+    reviewed=$((reviewed + 1))
+    continue
+  fi
+  
+  # 按级别检查衰减
+  case "$f_level" in
+    L3)
+      # 直接失效
+      if [ "$idle_days" -ge "$L3_EXPIRE_DAYS" ]; then
+        # 删除关联脚本
+        base=$(basename "$f" .yaml)
+        rm -f "$SKILLS_DIR/${base}.sh" 2>/dev/null || true
+        log "🗑️ [$f_id] $f_title → 删除（L3 ${idle_days}天未命中，超过${L3_EXPIRE_DAYS}天）"
+        rm -f "$f"
+        deleted=$((deleted + 1))
+        continue
+      fi
+      # 降级
+      if [ "$idle_days" -ge "$L3_DECAY_DAYS" ]; then
+        sed -i '' "s/^level: .*/level: L2/" "$f"
+        sed -i '' "s/^updated_at: .*/updated_at: $TODAY/" "$f"
+        # 删除关联脚本（用 basename 匹配）
+        base=$(basename "$f" .yaml)
+        rm -f "$SKILLS_DIR/${base}.sh" 2>/dev/null || true
+        log "📉 [$f_id] $f_title → L3 降为 L2（${idle_days}天未命中）"
+        demoted=$((demoted + 1))
+        continue
+      fi
+      # L3 脚本 90天没执行
+      base=$(basename "$f" .yaml)
+      script_file="$SKILLS_DIR/${base}.sh"
+      if [ -f "$script_file" ]; then
+        skill_mtime=$(stat -f "%m" "$script_file" 2>/dev/null || echo "$NOW_EPOCH")
+        script_idle=$(( (NOW_EPOCH - skill_mtime) / 86400 ))
+        if [ "$script_idle" -ge "$L3_DECAY_DAYS" ]; then
+          rm -f "$script_file"
+          sed -i '' "s/^level: .*/level: L2/" "$f"
+          sed -i '' "s/^updated_at: .*/updated_at: $TODAY/" "$f"
+          log "📉 [$f_id] L3脚本 ${script_idle}天未执行 → 降为 L2，删除脚本"
+          skills_removed=$((skills_removed + 1))
+          continue
+        fi
+      fi
+      ;;
+    L2)
+      # 直接失效
+      if [ "$idle_days" -ge "$L2_EXPIRE_DAYS" ]; then
+        log "🗑️ [$f_id] $f_title → 删除（L2 ${idle_days}天未命中，超过${L2_EXPIRE_DAYS}天）"
+        rm -f "$f"
+        deleted=$((deleted + 1))
+        continue
+      fi
+      # 降级
+      if [ "$idle_days" -ge "$L2_DECAY_DAYS" ]; then
+        sed -i '' "s/^level: .*/level: L1/" "$f"
+        sed -i '' "s/^updated_at: .*/updated_at: $TODAY/" "$f"
+        log "📉 [$f_id] $f_title → L2 降为 L1（${idle_days}天未命中）"
+        demoted=$((demoted + 1))
+        continue
+      fi
+      ;;
+    L1)
+      # 直接失效
+      if [ "$idle_days" -ge "$L1_EXPIRE_DAYS" ]; then
+        log "🗑️ [$f_id] $f_title → 删除（L1 ${idle_days}天未命中，超过${L1_EXPIRE_DAYS}天）"
+        rm -f "$f"
+        deleted=$((deleted + 1))
+        continue
+      fi
+      ;;
+  esac
+done
+
+# 清理孤儿脚本：没有对应卡片的 .sh 文件
+if [ -d "$SKILLS_DIR" ]; then
+  for script in "$SKILLS_DIR"/*.sh; do
+    [ -f "$script" ] || continue
+    base=$(basename "$script" .sh)
+    card_pattern="$CARDS_DIR/${base}.yaml"
+    # 提取ID部分查找
+    script_id=$(echo "$base" | sed 's/-.*//' )
+    found=false
+    for card in "$CARDS_DIR"/*.yaml; do
+      [ -f "$card" ] || continue
+      c_id=$(grep "^id:" "$card" | awk '{print $2}')
+      if [ "$c_id" = "$script_id" ]; then
+        found=true
+        break
+      fi
+    done
+    if [ "$found" = false ]; then
+      rm -f "$script"
+      log "🗑️ 清理孤儿脚本: $(basename $script)"
+      skills_removed=$((skills_removed + 1))
+    fi
+  done
+fi
+
+log "========== 扫描完成 =========="
+log "📊 降级: $demoted | 删除: $deleted | 待审查: $reviewed | 脚本清理: $skills_removed"

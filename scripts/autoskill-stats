@@ -1,0 +1,88 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v1.0.0
+# autoskill-stats - 统计面板
+# =============================================================================
+set -euo pipefail
+
+# 根据 OPENCLAW_STATE_DIR 自动选择数据目录（与 index.js 一致）
+_get_data_dir() {
+  if [ -n "${AUTOSKILL_DIR:-}" ]; then
+    echo "$AUTOSKILL_DIR"
+  elif [ -n "$OPENCLAW_STATE_DIR" ]; then
+    echo "$OPENCLAW_STATE_DIR/.auto-skill"
+  else
+    echo "$HOME/.openclaw/.auto-skill"
+  fi
+}
+DATA_DIR="$(_get_data_dir)"
+CARDS_DIR="$DATA_DIR/cards"
+SKILLS_DIR="$DATA_DIR/skills"
+
+echo "╔══════════════════════════════════════╗"
+echo "║   rocky-auto-skill 统计面板         ║"
+echo "╚══════════════════════════════════════╝"
+echo ""
+
+# 基本统计
+total=0
+l1=0; l2=0; l3=0
+active=0; review=0; expired=0
+manual=0; auto_src=0
+total_hits=0
+
+if ls "$CARDS_DIR"/*.yaml 2>/dev/null | head -1 | grep -q .; then
+  for f in "$CARDS_DIR"/*.yaml; do
+    [ -f "$f" ] || continue
+    total=$((total + 1))
+    
+    f_level=$(grep "^level:" "$f" | awk '{print $2}')
+    f_status=$(grep "^status:" "$f" | awk '{print $2}')
+    f_source=$(grep "^source:" "$f" | awk '{print $2}')
+    f_hits=$(grep "^hit_count:" "$f" | awk '{print $2}')
+    
+    case "$f_level" in L1) l1=$((l1+1)) ;; L2) l2=$((l2+1)) ;; L3) l3=$((l3+1)) ;; esac
+    case "$f_status" in active) active=$((active+1)) ;; review) review=$((review+1)) ;; expired) expired=$((expired+1)) ;; esac
+    case "$f_source" in manual) manual=$((manual+1)) ;; auto) auto_src=$((auto_src+1)) ;; esac
+    total_hits=$((total_hits + f_hits))
+  done
+fi
+
+# 技能脚本统计
+skill_count=0
+if ls "$SKILLS_DIR"/*.sh 2>/dev/null | head -1 | grep -q .; then
+  for f in "$SKILLS_DIR"/*.sh; do
+    [ -f "$f" ] && skill_count=$((skill_count + 1))
+  done
+fi
+
+echo "📊 卡片总数: $total"
+echo "   🟡 L1 经验: $l1"
+echo "   🟠 L2 验证: $l2"
+echo "   🔴 L3 技能: $l3"
+echo ""
+echo "📋 状态分布:"
+echo "   ✅ 活跃: $active"
+echo "   🔍 待审查: $review"
+echo "   ❌ 已失效: $expired"
+echo ""
+echo "🔧 来源:"
+echo "   自动晋升: $auto_src"
+echo "   手动创建: $manual"
+echo ""
+echo "📈 总命中次数: $total_hits"
+echo "🤖 L3 脚本数: $skill_count"
+echo ""
+
+# 工具分布
+if [ $total -gt 0 ]; then
+  echo "🔧 按工具分布:"
+  tools=$(grep "^tool:" "$CARDS_DIR"/*.yaml 2>/dev/null | awk '{print $2}' | sort | uniq -c | sort -rn)
+  echo "$tools" | while read count tool; do
+    echo "   $tool: $count"
+  done
+fi
+
+echo ""
+echo "📁 数据目录: $DATA_DIR"
+echo "📅 今日: $(date +%Y-%m-%d)"

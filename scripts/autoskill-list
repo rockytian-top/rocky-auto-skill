@@ -1,0 +1,117 @@
+#!/bin/bash
+# =============================================================================
+# rocky-auto-skill v1.0.0
+# autoskill-list - 查看所有卡片状态
+# =============================================================================
+set -euo pipefail
+
+# 根据 OPENCLAW_STATE_DIR 自动选择数据目录（与 index.js 一致）
+_get_data_dir() {
+  if [ -n "${AUTOSKILL_DIR:-}" ]; then
+    echo "$AUTOSKILL_DIR"
+  elif [ -n "$OPENCLAW_STATE_DIR" ]; then
+    echo "$OPENCLAW_STATE_DIR/.auto-skill"
+  else
+    echo "$HOME/.openclaw/.auto-skill"
+  fi
+}
+DATA_DIR="$(_get_data_dir)"
+CARDS_DIR="$DATA_DIR/cards"
+
+# 提取 title（处理引号）
+get_title() {
+  grep "^title:" "$1" | head -1 | sed 's/^title: *//;s/^"//;s/"$//'
+}
+
+# 用法
+usage() {
+  cat << 'EOF'
+用法: autoskill-list [--level L1|L2|L3] [--status active|review|expired] [--tool "工具名"]
+EOF
+}
+
+FILTER_LEVEL=""
+FILTER_STATUS=""
+FILTER_TOOL=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --level)   FILTER_LEVEL="$2"; shift 2 ;;
+    --status)  FILTER_STATUS="$2"; shift 2 ;;
+    --tool)    FILTER_TOOL="$2"; shift 2 ;;
+    --help|-h) usage; exit 0 ;;
+    *)         echo "未知参数: $1"; usage; exit 1 ;;
+  esac
+done
+
+if ! ls "$CARDS_DIR"/*.yaml 2>/dev/null | head -1 | grep -q .; then
+  echo "📭 还没有任何经验卡片"
+  exit 0
+fi
+
+# 统计
+total=0
+l1_count=0
+l2_count=0
+l3_count=0
+active_count=0
+review_count=0
+expired_count=0
+
+echo "📋 经验卡片列表"
+echo "=============================="
+
+for f in "$CARDS_DIR"/*.yaml; do
+  [ -f "$f" ] || continue
+  
+  f_id=$(grep "^id:" "$f" | awk '{print $2}')
+  f_title=$(get_title "$f")
+  f_level=$(grep "^level:" "$f" | awk '{print $2}')
+  f_tool=$(grep "^tool:" "$f" | awk '{print $2}')
+  f_status=$(grep "^status:" "$f" | awk '{print $2}')
+  f_hits=$(grep "^hit_count:" "$f" | awk '{print $2}')
+  f_last=$(grep "^last_hit_at:" "$f" | awk '{print $2}')
+  f_source=$(grep "^source:" "$f" | awk '{print $2}')
+  
+  # 过滤
+  [ -n "$FILTER_LEVEL" ] && [ "$f_level" != "$FILTER_LEVEL" ] && continue
+  [ -n "$FILTER_STATUS" ] && [ "$f_status" != "$FILTER_STATUS" ] && continue
+  [ -n "$FILTER_TOOL" ] && [ "$f_tool" != "$FILTER_TOOL" ] && continue
+  
+  # 级别 emoji
+  case "$f_level" in
+    L1) emoji="🟡" ;;
+    L2) emoji="🟠" ;;
+    L3) emoji="🔴" ;;
+    *)  emoji="⚪" ;;
+  esac
+  
+  # 状态标记
+  case "$f_status" in
+    active)  status_mark="✅" ;;
+    review)  status_mark="🔍" ;;
+    expired) status_mark="❌" ;;
+    *)       status_mark="❓" ;;
+  esac
+  
+  echo "$emoji [$f_id] $f_title"
+  echo "   工具: $f_tool | 命中: $f_hits | 来源: $f_source | 最后: $f_last $status_mark"
+  echo ""
+  
+  total=$((total + 1))
+  case "$f_level" in
+    L1) l1_count=$((l1_count + 1)) ;;
+    L2) l2_count=$((l2_count + 1)) ;;
+    L3) l3_count=$((l3_count + 1)) ;;
+  esac
+  case "$f_status" in
+    active)  active_count=$((active_count + 1)) ;;
+    review)  review_count=$((review_count + 1)) ;;
+    expired) expired_count=$((expired_count + 1)) ;;
+  esac
+done
+
+echo "=============================="
+echo "📊 统计: 共 $total 张卡片"
+echo "   🟡 L1: $l1_count | 🟠 L2: $l2_count | 🔴 L3: $l3_count"
+echo "   ✅ 活跃: $active_count | 🔍 待审查: $review_count | ❌ 已失效: $expired_count"

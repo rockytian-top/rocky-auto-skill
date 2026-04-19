@@ -1,337 +1,326 @@
-# rocky-auto-skill v2.7.0
+# rocky-auto-skill
 
-自动运维经验闭环系统 | Automated Operations Experience Closed-Loop System
+> OpenClaw 模型驱动的经验闭环插件 | Model-Driven Experience Closed-Loop Plugin for OpenClaw
+
+[![Version](https://img.shields.io/badge/version-3.0-blue)](./openclaw.plugin.json)
+[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+[![OpenClaw](https://img.shields.io/badge/OpenClaw-Plugin-orange)](https://github.com/openclaw/openclaw)
 
 ---
 
 ## 📖 概述 | Overview
 
-**rocky-auto-skill** 是一个自动运维经验闭环系统。当用户遇到问题时，系统自动搜索经验库并匹配可自动执行的L3技能脚本；当问题解决后，系统自动提示记录经验；高频复用的经验自动晋升为可执行技能。
+**rocky-auto-skill** 是一个 [OpenClaw](https://github.com/openclaw/openclaw) 网关插件，让 AI 助手自动积累运维经验、自动执行修复脚本、自动学习优化——形成完整的**经验闭环**。
 
-**rocky-auto-skill** is an automated operations experience closed-loop system. When users encounter problems, the system automatically searches the experience base and matches executable L3 skill scripts. After problems are resolved, the system automatically prompts to record the experience. Frequently-used experiences are automatically promoted to executable skills.
+**rocky-auto-skill** is an [OpenClaw](https://github.com/openclaw/openclaw) gateway plugin that enables your AI assistant to automatically accumulate operations experience, auto-execute repair scripts, and self-optimize — forming a complete **experience closed-loop**.
+
+### v3.0 核心变化 | v3.0 Key Changes
+
+- ❌ 移除 L1/L2/L3 级别机制
+- ❌ 移除 hit_count 晋升规则
+- ✅ 模型自主决策（而非固定规则）
+- ✅ 上下文感知的技能改进
 
 ---
 
-## ⚖️ 功能对比 | Feature Comparison
+## 🎯 核心理念 | Core Philosophy
 
-### OpenClaw 无插件 vs 安装插件 vs Hermes Agent
-
-| 功能 Feature | OpenClaw (无插件) | + rocky-auto-skill | Hermes Agent |
-|-------------|:-----------------:|:-----------------:|:------------:|
-| **问题搜索** | ❌ 手动搜索 | ✅ 自动搜索 | ✅ 手动搜索 |
-| **经验记录** | ❌ 无提示 | ✅ 自动提示 | ❌ 无提示 |
-| **脚本执行** | ❌ 手动执行 | ✅ 自动执行(L3) | ❌ 手动执行 |
-| **自动晋升** | ❌ 无 | ✅ L1→L2→L3 | ❌ 无 |
-| **成功率追踪** | ❌ 无 | ✅ 自动追踪 | ❌ 无 |
-| **hit计数** | ❌ 无 | ✅ 自动计数 | ❌ 无 |
-| **模板生成** | ❌ 无 | ✅ 自动生成 | ❌ 无 |
-| **上下文注入** | ❌ 无 | ✅ 自动注入 | ❌ 无 |
-| **错误检测** | ❌ 无 | ✅ 自动检测 | ❌ 无 |
-| **缓存机制** | ❌ 无 | ✅ 60秒缓存 | ❌ 无 |
-
-### 核心差异说明
-
-#### OpenClaw 无插件 (基础状态)
 ```
-用户: "端口占用"
-AI: (需要人工描述解决方案)
-用户: "如何解决端口占用？"
-AI: "使用 lsof -i:端口 查找进程，然后用 kill -9 PID 终止"
-```
-
-#### + rocky-auto-skill (增强状态)
-```
-用户: "端口占用"
-AI: → 自动匹配 "端口占用" L3技能
-     → 自动执行 015.sh
-     → 注入结果到上下文
-     → 返回: "端口80空闲" 或 "端口被PID 1234占用，已自动终止"
-```
-
-#### Hermes Agent
-```
-用户: "端口占用" 
-AI: (基于训练知识回答，但不执行脚本)
-"端口占用通常是由于未关闭的进程导致..."
+遇问题 → 自动搜索经验 → 模型判断 → 自动执行脚本 → 自动记录改进 → 模型持续优化
+  ↑                                                                                  |
+  └──────────────────── 经验闭环 Complete Closed Loop ──────────────────────────────┘
 ```
 
 ---
 
-## ✨ 功能特性 | Features
+## ✨ 核心功能 | Core Features
 
-### 1. 自动搜索 (Auto Search)
+### 1. 🔍 自动搜索经验 | Auto Search Experience
 
-**中文**: 遇问题时自动搜索经验库，支持 BM25 + 向量混合搜索
+**触发时机**：`before_agent_start` Hook，每次对话自动触发
 
-**English**: Automatically searches experience base on problems, supports BM25 + vector hybrid search
+| 功能 | 说明 |
+|------|------|
+| 错误检测 | 自动从AI响应提取错误（error:、failed、ENOENT等） |
+| 用户消息触发 | 检测用户问题关键词 |
+| 混合搜索 | BM25 + 向量语义相似度 |
+
+**验证方法 | Verification:**
+```bash
+python3 ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-search.py "关键词"
+```
+
+---
+
+### 2. 🤖 模型驱动决策 | Model-Driven Decision
+
+| 场景 | 模型决策 |
+|------|----------|
+| 匹配到技能 | 是否自动执行？ |
+| 未匹配技能 | 是否创建新技能？ |
+| 用户有反馈 | 是否改进技能？ |
+| 技能长期不用 | 是否删除？ |
+
+模型根据上下文自主判断，不再依赖固定规则。
+
+---
+
+### 3. 🔄 版本备份与回滚 | Version Backup & Rollback
+
+**备份触发**：脚本修改前自动备份
+
+**版本数量**：最多保留2个版本（.v1, .v2）
+
+**回滚触发**（自然语言）：
+- "回到上一个版本"
+- "撤销" / "回滚" / "恢复上一版"
+
+**验证方法 | Verification:**
+```bash
+# 查看备份文件
+ls -la ~/.openclaw/.auto-skill/skills/*/*.sh.v*
+
+# 回滚日志
+cat ~/.openclaw/.auto-skill/logs/improvements.jsonl
+```
+
+---
+
+### 4. 📝 上下文感知改进 | Context-Aware Improvement
+
+模型理解用户反馈的**真实意图**，而不只是匹配关键词。
+
+| 用户说 | 模型理解 |
+|--------|----------|
+| "不对" | 需要回滚或修改 |
+| "还要看XX" | 增强脚本 |
+| "太慢了" | 优化性能 |
+
+---
+
+### 5. 📊 每日沉寂扫描 | Daily Decay Scan
+
+自动清理长期不用的技能：
+- 30天未用 → 标记为沉寂
+- 90天未用 → 考虑删除
+
+---
+
+## 📊 功能对比图 | Feature Comparison
+
+### vs Hermes Agent
+
+| 功能 | Hermes Agent | rocky-auto-skill |
+|------|-------------|------------------|
+| **技能存储** | SKILL.md | .sh 脚本 + YAML |
+| **技能管理** | skill_manage 工具 | 直接写文件 |
+| **版本控制** | ❌ | ✅ 最多2个版本 |
+| **用户可控回滚** | ❌ | ✅ 自然语言触发 |
+| **改进日志** | ❌ | ✅ jsonl记录 |
+| **模型决策** | ✅ 自主决定 | ✅ 自主决定 |
+| **上下文理解** | ✅ | ✅ |
+| **衰减机制** | ❌ | ✅ |
+
+---
+
+## 🏗️ 架构 | Architecture
 
 ```
-触发条件：检测到错误信息 或 用户消息 ≥3字符(中文)
+┌─────────────────────────────────────────────────────────────┐
+│                     OpenClaw Gateway                        │
+│  ┌─────────────────────────────────────────────────────┐  │
+│  │              rocky-auto-skill Plugin                 │  │
+│  │  ┌─────────────────────────────────────────────────┐  │  │
+│  │  │            before_agent_start Hook              │  │  │
+│  │  │  1. 错误/用户消息检测                           │  │  │
+│  │  │  2. 经验搜索 (BM25 + 向量)                     │  │  │
+│  │  │  3. 匹配技能 → 模型判断是否执行               │  │  │
+│  │  │  4. 脚本执行 (autoExecuteScript)               │  │  │
+│  │  │  5. 结果注入 (prependContext)                 │  │  │
+│  │  │  6. 模型驱动的工作流分析                       │  │  │
+│  │  └─────────────────────────────────────────────────┘  │  │
+│  └─────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Data Directory                           │
+│  ~/.openclaw/.auto-skill/                                  │
+│  ├── cards/           # 经验卡片 (YAML)                    │
+│  ├── skills/          # 技能脚本 (.sh)                     │
+│  ├── scripts/         # 工具脚本                           │
+│  │   ├── autoskill-search.py                              │
+│  │   ├── autoskill-record.sh                              │
+│  │   ├── autoskill-list.sh                                │
+│  │   ├── autoskill-hit.sh                                 │
+│  │   └── autoskill-enhance.py                             │
+│  └── logs/            # 改进日志                           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 2. 自动执行 (Auto Execute)
+---
 
-**中文**: L3技能脚本成功率≥90%时自动执行，无需人工干预
+## 📦 数据结构 | Data Structure
 
-**English**: L3 skill scripts with ≥90% success rate are automatically executed without manual intervention
+### 经验卡片 (cards/)
 
-```javascript
-// 自动执行流程
-if (stats.exec_count === 0 || stats.rate >= 90) {
-  autoExecuteScript(scriptPath, cardId, title);
+```yaml
+# rocky-auto-skill 经验卡片
+id: 013
+title: "我的服务器内存怎么看"
+tool: bash
+tags: [服务器,监控]
+category: 运维
+
+hit_count: 6
+source: auto
+
+created_at: 2026-04-01
+last_hit_at: 2026-04-19
+updated_at: 2026-04-19
+status: active
+
+problem: |
+  如何查看服务器内存使用情况
+
+solution: |
+  使用 free 或 ps 命令查看内存
+
+skill_script: "013-memory.sh"
+```
+
+### 技能脚本 (skills/)
+
+```bash
+#!/bin/bash
+# 查看服务器内存
+set -euo pipefail
+echo "=== 内存使用情况 ==="
+free -h
+```
+
+---
+
+## 🚀 安装 | Installation
+
+### 自动安装 | Auto Install
+
+配置 `openclaw.plugin.json`：
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "rocky-auto-skill": {
+        "url": "github:rockytian-top/rocky-auto-skill"
+      }
+    }
+  }
 }
 ```
 
-### 3. 自动记录 (Auto Record)
-
-**中文**: 问题解决后自动提示记录经验到知识库
-
-**English**: Automatically prompts to record experience after problem resolution
-
-```
-💡 提示：这个问题解决了吗？记入经验库方便下次复用：
-bash autoskill-record --title "标题" --tool "工具" --problem "问题" --solution "方案"
-```
-
-### 4. 自动晋升 (Auto Promotion)
-
-**中文**: 高频使用的经验自动从L1晋升到L2再到L3，最终成为可自动执行的技能
-
-**English**: Frequently-used experiences automatically promote from L1 → L2 → L3, becoming auto-executable skills
-
-| 等级 | 晋升条件 | 执行方式 |
-|------|----------|----------|
-| L1 | 初始 | 仅搜索结果 |
-| L2 | L1 + 脚本模板 + ≥60%成功率 | 人工确认后执行 |
-| L3 | L2 + ≥90%成功率 | **自动执行** |
-
-### 5. 三级渐进机制 (Three-Level Progressive)
-
-**中文**: L1→L2→L3 渐进晋升，确保安全
-
-**English**: L1→L2→L3 progressive promotion ensures safety
-
-```
-L1 (基础) → 人工判断搜索结果
-    ↓ 命中≥3次 + 创建脚本
-L2 (进阶) → 人工确认后执行
-    ↓ 成功率≥90%
-L3 (专家) → 自动执行
-```
-
----
-
-## 🏗️ 系统架构 | Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      用户交互层                              │
-│                  User Interaction Layer                      │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    插件核心 (Hook)                           │
-│                  Plugin Core (Hook)                         │
-│  ┌─────────────────────────────────────────────────────┐   │
-│  │            before_agent_start                        │   │
-│  │  1. extractLastError()    - 提取错误信息           │   │
-│  │  2. extractUserMessage()  - 提取用户消息           │   │
-│  │  3. refreshCache()       - 刷新技能缓存            │   │
-│  │  4. searchCards()        - 搜索经验卡片            │   │
-│  │  5. matchL3Skills()      - 匹配L3技能             │   │
-│  │  6. autoExecuteScript()  - 自动执行脚本           │   │
-│  │  7. injectContext()      - 注入结果到上下文        │   │
-│  └─────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                      数据存储层                              │
-│                    Data Storage Layer                        │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐    │
-│  │    cards/    │  │   skills/    │  │    logs/     │    │
-│  │   经验卡片    │  │   脚本文件    │  │    执行日志    │    │
-│  └──────────────┘  └──────────────┘  └──────────────┘    │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 📦 目录结构 | Directory Structure
-
-```
-rocky-auto-skill/
-├── index.js                  # 主插件代码 | Main plugin code
-├── openclaw.plugin.json      # 插件配置 | Plugin configuration
-├── autoskill-search          # Shell wrapper | Shell wrapper
-├── autoskill-search.py       # 混合搜索引擎 | Hybrid search engine
-└── README.md                 # 本文档 | This file
-
-~/.openclaw/.auto-skill/      # 数据目录 | Data directory
-├── cards/                    # 经验卡片 | Experience cards (YAML)
-│   ├── 001.yaml
-│   ├── 002.yaml
-│   └── ...
-├── skills/                   # 脚本文件 | Script files
-│   ├── 001.sh
-│   ├── 002.sh
-│   └── ...
-└── logs/                    # 执行日志 | Execution logs
-    └── auto-skill.log
-```
-
----
-
-## 🔧 安装 | Installation
-
-### 方式一：自动安装（推荐）| Auto-install (Recommended)
-
-插件首次加载时自动检测并创建所需目录和文件：
-
-Plugin automatically detects and creates required directories on first load:
+### 手动安装 | Manual Install
 
 ```bash
-# 插件首次加载时自动安装
-# 重启网关后插件自动安装
-openclaw gateway restart
-```
-
-### 方式二：手动安装 | Manual Install
-
-```bash
-# 复制到 extensions 目录
+# 1. 克隆仓库
 git clone https://github.com/rockytian-top/rocky-auto-skill.git
-cp -r rocky-auto-skill ~/.openclaw/extensions/
+cd rocky-auto-skill
 
-# 重启网关
+# 2. 复制到插件目录
+cp -r . ~/.openclaw/extensions/rocky-auto-skill/
+
+# 3. 重启网关
 openclaw gateway restart
 ```
 
 ---
 
-## 📋 经验卡片格式 | Experience Card Format
+## 📖 使用方法 | Usage
 
-```yaml
-# ~/.openclaw/.auto-skill/cards/015.yaml
-id: 015
-title: 端口占用
-level: L3
-problem: 端口被占用无法启动服务
-solution: 使用 lsof 和 kill 命令释放端口
-skill_script: 015.sh
-embedding: [...]  # 向量嵌入
-created_at: 2026-04-18
-stats:
-  exec_count: 5
-  exec_success: 5
-  last_used: 2026-04-18
-```
+### 自动触发（无需手动）
 
----
-
-## 🎯 使用方法 | Usage
-
-### 自动触发场景 | Auto Trigger Scenarios
-
-**场景1: 用户报告问题**
-```
-用户: "端口占用"
-系统: → 检测关键词 "端口占用"
-     → 匹配 L3 技能 "端口占用"
-     → 检查成功率 ≥90%
-     → 自动执行 015.sh
-     → 注入结果: "端口80空闲"
-```
-
-**场景2: AI 遇到错误**
-```
-AI: [error] port 80 already in use
-系统: → 提取错误 "port 80 already in use"
-     → 搜索匹配的经验
-     → 自动执行解决方案
-```
+| 操作 | 说明 |
+|------|------|
+| 遇到问题 | 自动搜索经验库 |
+| 匹配到技能 | 模型判断是否执行 |
+| 执行后有反馈 | 模型判断是否改进 |
 
 ### 手动命令 | Manual Commands
 
 ```bash
 # 搜索经验
-python3 ~/.openclaw/extensions/rocky-auto-skill/autoskill-search "端口占用"
+python3 ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-search.py "关键词"
 
 # 记录经验
-bash ~/.openclaw/extensions/rocky-auto-skill/autoskill-record \
-  --title "Nginx端口占用处理" \
-  --tool "lsof, kill" \
-  --problem "端口被占用无法启动" \
-  --solution "lsof -i:80 找到PID，kill -9终止"
+bash ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-record.sh \
+  --title "标题" --tool "工具" --problem "问题" --solution "方案"
 
-# 晋升经验
-bash ~/.openclaw/extensions/rocky-auto-skill/autoskill-promote 015
+# 查看列表
+bash ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-list.sh
 
-# 查看统计
-bash ~/.openclaw/extensions/rocky-auto-skill/autoskill-stats 015
+# 标记有用
+bash ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-hit.sh 013
+
+# 回滚（自然语言）
+"回到上一个版本"
 ```
 
+### 自然语言交互
+
+| 你说 | 插件自动 |
+|------|----------|
+| "帮我记录一个经验：..." | 创建经验卡片 |
+| "查看经验统计" | 显示统计面板 |
+| "列出所有经验" | 列出所有卡片 |
+| "回到上一个版本" | 回滚脚本 |
+| "这个有用" / "hit" | 标记经验有用 |
+
 ---
 
-## 📊 技能等级 | Skill Levels
+## 🔧 配置 | Configuration
 
-| 等级 | 触发条件 | 执行方式 | 提示信息 |
-|------|----------|----------|----------|
-| L1 | 搜索命中 | 无 | "找到N个相关经验" |
-| L2 | 命中≥3次 + 脚本 | 人工确认 | "建议执行脚本..." |
-| L3 | 成功率≥90% | **自动执行** | "已自动执行..." |
+### 环境变量
 
----
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `OPENCLAW_STATE_DIR` | `~/.openclaw` | 数据目录根路径 |
 
-## 🔐 安全机制 | Security
+### 数据目录
 
-| 机制 | 说明 |
+| 路径 | 说明 |
 |------|------|
-| 超时保护 | 脚本执行超时30秒自动终止 |
-| 缓存去重 | 60秒内同一脚本不重复执行 |
-| 路径限制 | 只执行 `.auto-skill/skills/` 目录 |
-| 模板跳过 | 自动跳过含 `auto-generated` 标记的模板 |
-| 成功率门槛 | 低于90%不自动执行 |
+| `~/.openclaw/.auto-skill/cards/` | 经验卡片 |
+| `~/.openclaw/.auto-skill/skills/` | 技能脚本 |
+| `~/.openclaw/.auto-skill/scripts/` | 工具脚本 |
+| `~/.openclaw/.auto-skill/logs/` | 改进日志 |
 
 ---
 
-## 🐛 故障排查 | Troubleshooting
+## ❓ 常见问题 | FAQ
 
-### 插件未加载
+### Q: 插件不生效怎么办？
+
+1. 检查插件是否加载：`grep rocky-auto-skill ~/.openclaw/logs/gateway.log`
+2. 检查数据目录：`ls ~/.openclaw/.auto-skill/cards/`
+3. 重启网关：`openclaw gateway restart`
+
+### Q: 如何查看技能脚本？
+
 ```bash
-# 检查插件状态
-grep "rocky-auto-skill" ~/.openclaw/logs/gateway.log
-
-# 确认目录结构
-ls -la ~/.openclaw/extensions/rocky-auto-skill/
+ls ~/.openclaw/.auto-skill/skills/
 ```
 
-### 自动执行未触发
-1. 确认消息≥3字符（中文）
-2. 确认L3技能存在：`ls ~/.openclaw/.auto-skill/cards/`
-3. 确认脚本文件存在：`ls ~/.openclaw/.auto-skill/skills/`
-4. 检查成功率≥90%
+### Q: 如何手动触发技能？
 
-### 查看执行日志
+在对话中包含关键词，或直接调用脚本：
 ```bash
-tail -f ~/.openclaw/logs/gateway.log | grep "execResult"
+bash ~/.openclaw/.auto-skill/skills/013-memory.sh
 ```
 
----
+### Q: 回滚失败怎么办？
 
-## 📝 与 Hermes Agent 对比 | vs Hermes Agent
-
-| 维度 | rocky-auto-skill | Hermes Agent |
-|------|-----------------|--------------|
-| **架构** | OpenClaw Plugin | 独立Agent |
-| **执行方式** | 自动执行脚本 | 知识回答 |
-| **学习方式** | 自动晋升 | 训练知识 |
-| **数据存储** | 本地YAML | 云端训练 |
-| **定制难度** | 低（脚本即技能） | 高（需重新训练）|
-| **响应速度** | 即时 | 依赖LLM |
-
-**核心差异**: rocky-auto-skill 是"执行者"，Hermes Agent 是"回答者"
+1. 检查备份文件是否存在：`ls ~/.openclaw/.auto-skill/skills/*/*.sh.v*`
+2. 检查日志：`cat ~/.openclaw/.auto-skill/logs/improvements.jsonl`
 
 ---
 
@@ -341,11 +330,13 @@ MIT License
 
 ---
 
-## 🤝 贡献 | Contributing
+## 🔗 相关链接 | Links
 
-Issues and Pull Requests are welcome!
+- [GitHub](https://github.com/rockytian-top/rocky-auto-skill)
+- [Gitee](https://gitee.com/rocky_tian/rocky-auto-skill)
+- [OpenClaw](https://github.com/openclaw/openclaw)
+- [Hermes Agent](https://github.com/NousResearch/hermes-agent)
 
 ---
 
-_版本 Version: 2.7.0_  
-_更新 Update: 2026-04-18_
+_Version: 3.0 | Updated: 2026-04-19_
