@@ -1,68 +1,72 @@
 # 更新日志 | Changelog
 
-All notable changes to this project will be documented in this file.
+## v3.0.0 (2026-04-19)
+
+### 核心变化 | Breaking Changes
+
+- ❌ **移除 L1/L2/L3 级别机制** - 不再区分技能等级
+- ❌ **移除 hit_count 晋升规则** - 不再根据命中次数晋升
+- ❌ **移除 exec_count/success_count 统计** - 不再追踪执行次数
+
+### 新增功能 | New Features
+
+- ✅ **模型驱动决策** - 模型根据上下文自主判断，而非固定规则
+- ✅ **上下文感知改进** - 模型理解用户反馈的真实意图
+- ✅ **模型分析工作流** - 通过 LLM 分析对话决定是否生成/优化/删除技能
+
+### 架构简化 | Simplified Architecture
+
+```
+用户问问题
+    ↓
+模型检查是否有相关技能
+    ↓
+模型决定：
+├── 有相关技能 → 直接使用/更新
+├── 无相关技能 → 创建新技能
+└── 需要执行 → 模型决定执行脚本
+```
 
 ---
 
-## [2.10.1] - 2026-04-19
+## v2.10.1 (2026-04-19)
 
-### Changed
-- 最多保留2个版本备份（从5个减少）
-- 强化技能改进提示词，学习Hermes主动性
+### 改进 | Improvements
 
-### Fixed
-- 回滚时跳过 contextModify 检测，避免Python调用失败
-
----
-
-## [2.10.0] - 2026-04-19
-
-### Added
-- **版本备份机制**：脚本修改前自动备份，最多2个版本
-- **回滚机制**：用户可说"回到上一个版本"回滚
-- **改进日志**：记录到 `logs/improvements.jsonl`
-- **Agent主动改进提示词**：学习Hermes SKILLS_GUIDANCE
-
-### Changed
-- `prependSystemContext` 新增技能改进指南
+- MAX_BACKUP_VERSIONS 从 5 改为 2
+- 提示词强化（学习 Hermes 主动性）
+- 完整中英文文档 + Wiki
 
 ---
 
-## [2.9.1] - 2026-04-19
+## v2.10.0 (2026-04-19)
 
-### Added
-- 完整中英文文档（README.md）
-- docs/ 目录（Wiki格式）
-- Home.md, Installation.md, Usage.md, Architecture.md, FAQ.md
+### 新增功能 | New Features
 
----
-
-## [2.9.0] - 2026-04-18
-
-### Added
-- 完整脚本内置到 `scripts/` 目录
-- 路径独立化（插件自身优先）
-- 完整中英文文档
+- 脚本版本备份（最多保留5个版本）
+- 回滚机制（自然语言触发）
+- 改进日志（logs/improvements.jsonl）
 
 ---
 
-## [2.0.0] - 2026-03-22
+## v2.9.1 (2026-04-19)
 
-### Added
-- L1/L2/L3 技能等级机制
-- 自动晋升规则
-- BM25 + 向量搜索
-- 衰减机制
+### 修复 | Bug Fixes
 
----
+- 脚本内置到插件目录（解决分发问题）
+- autoInstall 复制逻辑修复
+- 多网关数据隔离（AUTOSKILL_DIR 环境变量）
 
-## [1.0.0] - 2026-03-09
+### 新增功能 | New Features
 
-### Added
-- 初始版本
-- 基础经验搜索
-- 脚本执行
+- 自然语言记录支持
 
 ---
 
-[返回首页](./Home.md)
+## v2.9.0 (2026-04-19)
+
+### 初始版本 | Initial Version
+
+- 自动搜索经验（BM25+向量）
+- 自动执行脚本
+- 每日沉寂扫描

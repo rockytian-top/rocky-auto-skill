@@ -1,15 +1,15 @@
-# 使用说明 | Usage Guide
+# 使用说明 | Usage
 
 ## 自动触发 | Auto Trigger
 
-插件在 `before_agent_start` 钩子自动运行，无需手动干预：
+插件在 `before_agent_start` Hook 自动运行，无需手动干预。
 
 | 场景 | 自动行为 |
 |------|----------|
-| 用户提问 | 搜索经验库 |
-| 匹配L3技能 | 自动执行脚本 |
-| 脚本失败 | 记录失败日志 |
-| 成功率达标 | 自动晋升L3 |
+| 用户遇到问题 | 自动搜索经验库 |
+| 匹配到技能 | 模型判断是否执行 |
+| 执行完成 | 模型判断是否改进 |
+| 用户有反馈 | 模型理解意图并响应 |
 
 ---
 
@@ -18,71 +18,72 @@
 ### 搜索经验
 
 ```bash
-python3 ~/.openclaw/.auto-skill/scripts/autoskill-search.py "关键词"
-python3 ~/.openclaw/.auto-skill/scripts/autoskill-search.py "端口占用" --top 5
+python3 ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-search.py "关键词"
 ```
 
 ### 记录经验
 
 ```bash
-bash ~/.openclaw/.auto-skill/scripts/autoskill-record.sh \
-  --title "SSH连接超时" \
-  --tool "ssh" \
-  --problem "服务器连接超时" \
-  --solution "检查网络和防火墙"
+bash ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-record.sh \
+  --title "标题" --tool "工具" --problem "问题" --solution "方案"
 ```
 
 ### 查看列表
 
 ```bash
-bash ~/.openclaw/.auto-skill/scripts/autoskill-list.sh
+bash ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-list.sh
 ```
 
 ### 标记有用
 
 ```bash
-bash ~/.openclaw/.auto-skill/scripts/autoskill-hit.sh 013
-```
-
-### 查看单个卡片
-
-```bash
-bash ~/.openclaw/.auto-skill/scripts/autoskill-list.sh 013
+bash ~/.openclaw/extensions/rocky-auto-skill/scripts/autoskill-hit.sh 013
 ```
 
 ---
 
-## 自然语言操作 | Natural Language
+## 自然语言交互 | Natural Language
 
-| 操作 | 示例 |
-|------|------|
-| 搜索经验 | "帮我搜一下端口占用的解决方法" |
-| 记录经验 | "把这个解决方法记下来" |
-| 回滚 | "回到上一个版本" / "撤销" |
-| 标记有用 | "这个有用" |
+| 你说 | 插件自动 |
+|------|----------|
+| "帮我记录一个经验：..." | 创建经验卡片 |
+| "查看经验统计" | 显示统计面板 |
+| "列出所有经验" | 列出所有卡片 |
+| "搜索 XXX" | 搜索相关经验 |
+| "这个有用" / "hit" | 标记经验有用 |
+| "回到上一个版本" | 回滚脚本 |
+| "撤销" / "回滚" | 回滚脚本 |
 
 ---
 
-## 查看日志 | View Logs
+## 验证方法 | Verification
+
+### 检查插件是否加载
 
 ```bash
-# 查看改进日志
+grep rocky-auto-skill ~/.openclaw/logs/gateway.log
+```
+
+### 查看经验卡片
+
+```bash
+ls ~/.openclaw/.auto-skill/cards/
+```
+
+### 查看技能脚本
+
+```bash
+ls ~/.openclaw/.auto-skill/skills/
+```
+
+### 查看备份文件
+
+```bash
+ls -la ~/.openclaw/.auto-skill/skills/*/*.sh.v*
+```
+
+### 查看改进日志
+
+```bash
 cat ~/.openclaw/.auto-skill/logs/improvements.jsonl
-
-# 查看网关日志
-tail -f ~/.openclaw/logs/gateway.log | grep rocky-auto-skill
 ```
-
----
-
-## 版本备份 | Version Backup
-
-备份自动创建在：
-```
-~/.openclaw/.auto-skill/skills/013/.sh.v1
-~/.openclaw/.auto-skill/skills/013/.sh.v2
-```
-
----
-
-[返回首页](./Home.md)
