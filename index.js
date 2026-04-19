@@ -1,5 +1,5 @@
 /**
- * rocky-auto-skill Plugin v2.9.1
+ * rocky-auto-skill Plugin v2.10.0
  *
  * 全自动闭环经验系统：
  * 1. 自动检测错误 + 用户问题关键词
@@ -13,8 +13,159 @@
  */
 
 const { execSync } = require('child_process');
-const { existsSync, readFileSync, readdirSync, statSync, writeFileSync, chmodSync } = require('fs');
+const { existsSync, readFileSync, readdirSync, statSync, writeFileSync, chmodSync, copyFileSync, unlinkSync } = require('fs');
 const { join } = require('path');
+
+// ==================== 脚本版本备份 ====================
+const MAX_BACKUP_VERSIONS = 5;
+
+/**
+ * 备份当前脚本版本
+ * @param {string} scriptPath - 脚本完整路径
+ * @returns {boolean} - 是否成功
+ */
+function backupScript(scriptPath) {
+  try {
+    if (!existsSync(scriptPath)) return false;
+    
+    const stats = statSync(scriptPath);
+    const mtime = stats.mtime.toISOString().slice(0, 10);
+    
+    // 获取现有版本信息
+    const metaPath = scriptPath + '.versions.json';
+    let versions = [];
+    if (existsSync(metaPath)) {
+      try {
+        versions = JSON.parse(readFileSync(metaPath, 'utf-8'));
+      } catch(e) { versions = []; }
+    }
+    
+    // 添加当前版本记录（如果内容有变化）
+    const currentContent = readFileSync(scriptPath, 'utf-8');
+    const lastVersion = versions[0];
+    if (!lastVersion || lastVersion.content !== currentContent) {
+      versions.unshift({
+        version: (versions.length + 1),
+        date: mtime,
+        content: currentContent,
+        size: currentContent.length
+      });
+    }
+    
+    // 只保留最近MAX_BACKUP_VERSIONS个版本
+    versions = versions.slice(0, MAX_BACKUP_VERSIONS);
+    
+    // 保存版本元数据
+    const metaToSave = versions.map(v => ({ version: v.version, date: v.date, size: v.size }));
+    writeFileSync(metaPath, JSON.stringify(metaToSave, null, 2), 'utf-8');
+    
+    // 备份文件：v1, v2, v3, v4, v5
+    for (let i = 0; i < versions.length; i++) {
+      const backupPath = scriptPath + '.v' + (i + 1);
+      if (!existsSync(backupPath) || readFileSync(backupPath, 'utf-8') !== versions[i].content) {
+        writeFileSync(backupPath, versions[i].content, 'utf-8');
+      }
+    }
+    
+    // 删除多余的备份文件
+    for (let i = versions.length + 1; i <= MAX_BACKUP_VERSIONS; i++) {
+      const backupPath = scriptPath + '.v' + i;
+      if (existsSync(backupPath)) {
+        try { unlinkSync(backupPath); } catch(e) {}
+      }
+    }
+    
+    console.log('[DEBUG] backupScript: backed up', scriptPath, 'versions:', versions.length);
+    return true;
+  } catch(e) {
+    console.log('[DEBUG] backupScript error:', e.message);
+    return false;
+  }
+}
+
+/**
+ * 回滚到上一个版本
+ * @param {string} scriptPath - 脚本完整路径
+ * @returns {object} - {success, content, message}
+ */
+function rollbackScript(scriptPath) {
+  try {
+    const metaPath = scriptPath + '.versions.json';
+    if (!existsSync(metaPath)) {
+      return { success: false, message: '没有可用的备份版本' };
+    }
+    
+    let versions = [];
+    try {
+      versions = JSON.parse(readFileSync(metaPath, 'utf-8'));
+    } catch(e) {
+      return { success: false, message: '备份元数据损坏' };
+    }
+    
+    if (versions.length < 2) {
+      return { success: false, message: '没有足够的备份版本可供回滚' };
+    }
+    
+    // 使用倒数第二个版本（当前是第一个）
+    const prevVersion = versions[1];
+    const backupPath = scriptPath + '.v2';
+    
+    if (!existsSync(backupPath)) {
+      return { success: false, message: '备份文件丢失' };
+    }
+    
+    const prevContent = readFileSync(backupPath, 'utf-8');
+    
+    // 先备份当前版本
+    backupScript(scriptPath);
+    
+    // 恢复为上一个版本
+    writeFileSync(scriptPath, prevContent, 'utf-8');
+    chmodSync(scriptPath, 0o755);
+    
+    // 更新元数据：移除最新版本（当前版本已变为上一个）
+    const newVersions = versions.slice(1);
+    const metaToSave = newVersions.map(v => ({ version: v.version, date: v.date, size: v.size }));
+    writeFileSync(metaPath, JSON.stringify(metaToSave, null, 2), 'utf-8');
+    
+    return { success: true, content: prevContent, message: '已回滚到上一个版本', version: prevVersion.version };
+  } catch(e) {
+    console.log('[DEBUG] rollbackScript error:', e.message);
+    return { success: false, message: '回滚失败: ' + e.message };
+  }
+}
+
+/**
+ * 记录技能改进日志
+ * @param {string} cardId - 技能卡ID
+ * @param {string} action - 动作类型
+ * @param {object} details - 详情
+ */
+function logSkillImprovement(cardId, action, details) {
+  try {
+    const home = process.env.HOME || '/root';
+    const stateDir = process.env.OPENCLAW_STATE_DIR || `${home}/.openclaw`;
+    const dataDir = join(stateDir, '.auto-skill');
+    const logDir = join(dataDir, 'logs');
+    
+    // 确保日志目录存在
+    if (!existsSync(logDir)) {
+      try { execSync('mkdir -p "' + logDir + '"'); } catch(e) {}
+    }
+    
+    const logFile = join(logDir, 'improvements.jsonl');
+    const timestamp = new Date().toISOString();
+    const logEntry = JSON.stringify({ timestamp, cardId, action, ...details }) + '\n';
+    
+    // 追加到日志文件
+    const existing = existsSync(logFile) ? readFileSync(logFile, 'utf-8') : '';
+    writeFileSync(logFile, existing + logEntry, 'utf-8');
+    
+    console.log('[DEBUG] logSkillImprovement:', cardId, action);
+  } catch(e) {
+    console.log('[DEBUG] logSkillImprovement error:', e.message);
+  }
+}
 
 // ==================== 自动安装 ====================
 function autoInstall() {
@@ -1012,6 +1163,9 @@ function applySkillUpdate(skillCard, update, sessionDir) {
     const newScript = update.newScript || update.script;
     if (!newScript) return false;
 
+    // 更新前先备份当前版本
+    backupScript(scriptPath);
+
     writeFileSync(scriptPath, `#!/bin/bash\n# Auto-updated by model\n# ${update.reason || ''}\n\n${newScript}\n`, 'utf-8');
     chmodSync(scriptPath, 0o755);
 
@@ -1022,6 +1176,12 @@ function applySkillUpdate(skillCard, update, sessionDir) {
       cardContent = cardContent.replace(/^updated_at:.*$/m, `updated_at: ${new Date().toISOString().slice(0, 10)}`);
       writeFileSync(join(sessionDir, 'cards', cardFile), cardContent, 'utf-8');
     }
+
+    // 记录改进日志
+    logSkillImprovement(skillCard.id, 'apply_update', {
+      reason: update.reason || '',
+      scriptPath: scriptPath
+    });
 
     console.log('[DEBUG] workflow: skill updated by model:', skillCard.id, update.reason || '');
     cache.ts = 0;
@@ -1517,6 +1677,17 @@ module.exports = {
       ];
       const hasHitIntent = hitIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
 
+      // ---------- 回滚意图 ----------
+      const rollbackIntentPatterns = [
+        /^\s*回到上一个版本/,
+        /^\s*撤销/,
+        /^\s*回滚/,
+        /^\s*恢复上一版/,
+        /^\s*取消.*修改/,
+        /^\s*不对.*取消/
+      ];
+      const hasRollbackIntent = rollbackIntentPatterns.some(p => p.test(userMsg));
+
       // ---------- 反馈意图 ----------
       // 上下文相关的脚本修改（无需明确命令，根据对话上下文隐式判断）
       // 只要消息与当前执行的技能相关，且包含"增加"、"加"、"还要"等词，就触发脚本修改
@@ -1618,6 +1789,38 @@ ${hitOutput}
             cache.ts = 0;
           }
         }
+        // ----- 回滚意图 -----
+        else if (hasRollbackIntent) {
+          console.log('[DEBUG] natural language rollback intent detected:', userMsg.slice(0, 50));
+          // 获取当前执行的技能路径（如果有）
+          if (lastExecutedSkill && lastExecutedSkill.scriptPath) {
+            const rollbackResult = rollbackScript(lastExecutedSkill.scriptPath);
+            if (rollbackResult.success) {
+              result.prependContext = `🔄 ${rollbackResult.message}
+📌 技能：${lastExecutedSkill.title}
+
+脚本已恢复到版本 #${rollbackResult.version}，下次执行会使用该版本~
+
+---
+`;
+              logSkillImprovement(lastExecutedSkill.cardId, 'rollback', {
+                fromVersion: 'current',
+                toVersion: rollbackResult.version
+              });
+              cache.ts = 0;
+            } else {
+              result.prependContext = `⚠️ ${rollbackResult.message}
+
+---
+`;
+            }
+          } else {
+            result.prependContext = `⚠️ 没有可回滚的技能记录
+
+---
+`;
+          }
+        }
       } catch(e) {
         console.log('[DEBUG] natural language command error:', e.message);
       }
@@ -1634,15 +1837,25 @@ ${hitOutput}
           // 生成增强后的脚本
           const newScript = applyScriptEnhancement(title, currentScript, enhancement);
           if (newScript && newScript !== currentScript) {
+            // 更新前先备份当前版本
+            backupScript(scriptPath);
+
             writeFileSync(scriptPath, newScript, 'utf-8');
             chmodSync(scriptPath, 0o755);
+
+            // 记录改进日志
+            logSkillImprovement(cardId, 'context_enhancement', {
+              enhancement: enhancement,
+              scriptPath: scriptPath
+            });
+
             console.log('[DEBUG] context script updated for card:', cardId, 'enhancement:', enhancement);
 
             result.prependContext = `🔧 已根据上下文自动增强技能脚本：
 📌 技能：${title}
 💡 增强：${enhancement}
 
-脚本已更新，下次执行会使用增强版本~
+脚本已更新，下次执行会使用增强版本~ 如需回滚，说"回到上一个版本"
 
 ---
 `;
