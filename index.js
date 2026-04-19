@@ -32,49 +32,85 @@ function getGatewayConfig() {
   return null;
 }
 
-function getModelCredentials() {
-  // 从网关配置读取模型凭证和模型名称
+function getModelCredentials(agentModel) {
+  // agentModel 格式: "provider/model" 如 "minimax-portal/MiniMax-M2.7-highspeed"
+  // 优先使用 agent 实际使用的模型，保持一致
   const config = getGatewayConfig();
-  if (config && config.models && config.models.providers) {
-    // 优先使用 zai（有 apiKey 的 provider）
-    const zai = config.models.providers['zai'];
-    if (zai && zai.apiKey) {
-      const modelId = zai.models && zai.models[0] ? zai.models[0].id : 'glm-5';
-      return {
-        baseUrl: zai.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
-        apiKey: zai.apiKey,
-        authHeader: false,
-        apiType: 'openai',
-        model: modelId
-      };
-    }
-    // minimax-portal 或其他 provider
-    const providerNames = Object.keys(config.models.providers);
-    for (const name of providerNames) {
-      const p = config.models.providers[name];
-      if (p && (p.apiKey || p.authHeader)) {
-        const modelId = p.models && p.models[0] ? p.models[0].id : 'MiniMax-M2.7-highspeed';
-        return {
-          baseUrl: p.baseUrl || 'https://api.minimaxi.com/anthropic',
-          apiKey: p.apiKey || '',
-          authHeader: p.authHeader || false,
-          apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic',
-          model: modelId
-        };
+
+  // 如果提供了 agentModel，解析出 provider
+  let targetProvider = null;
+  let targetModel = null;
+  if (agentModel && agentModel.includes('/')) {
+    const parts = agentModel.split('/');
+    targetProvider = parts[0];
+    targetModel = parts[1];
+  }
+
+  if (config) {
+    // 尝试从 agents 配置中找到实际使用的 model
+    if (!targetProvider && config.agents && config.agents.list) {
+      // 遍历 agents，找有 model 且包含 / 的
+      for (const agent of config.agents.list) {
+        if (agent.model && agent.model.includes('/')) {
+          const parts = agent.model.split('/');
+          targetProvider = parts[0];
+          targetModel = parts[1];
+          break;
+        }
       }
     }
-    // provider 没有 apiKey 但有 authHeader（OAuth）
-    for (const name of providerNames) {
-      const p = config.models.providers[name];
-      if (p && p.authHeader && !p.apiKey) {
-        const modelId = p.models && p.models[0] ? p.models[0].id : 'MiniMax-M2.7-highspeed';
-        return {
-          baseUrl: p.baseUrl || 'https://api.minimaxi.com/anthropic',
-          apiKey: process.env.ANTHROPIC_AUTH_TOKEN || '',
-          authHeader: true,
-          apiType: 'anthropic',
-          model: modelId
-        };
+
+    // 使用 targetProvider 的配置
+    if (targetProvider && config.models && config.models.providers) {
+      const provider = config.models.providers[targetProvider];
+      if (provider) {
+        const modelId = targetModel || (provider.models && provider.models[0] ? provider.models[0].id : null);
+        if (provider.authHeader) {
+          // OAuth 模式（agent 实际使用）
+          return {
+            baseUrl: provider.baseUrl || 'https://api.minimaxi.com/anthropic',
+            apiKey: process.env.ANTHROPIC_AUTH_TOKEN || '',
+            authHeader: true,
+            apiType: 'anthropic',
+            model: modelId || 'MiniMax-M2.7-highspeed'
+          };
+        }
+        if (provider.apiKey) {
+          return {
+            baseUrl: provider.baseUrl || 'https://api.minimaxi.com/anthropic',
+            apiKey: provider.apiKey,
+            authHeader: false,
+            apiType: (provider.api && provider.api.includes('openai')) ? 'openai' : 'anthropic',
+            model: modelId || 'MiniMax-M2.7-highspeed'
+          };
+        }
+      }
+    }
+
+    // 兜底：遍历 providers，优先 authHeader（通常是 agent 实际用的）
+    if (config.models && config.models.providers) {
+      for (const [name, p] of Object.entries(config.models.providers)) {
+        if (p.authHeader) {
+          return {
+            baseUrl: p.baseUrl || 'https://api.minimaxi.com/anthropic',
+            apiKey: process.env.ANTHROPIC_AUTH_TOKEN || '',
+            authHeader: true,
+            apiType: 'anthropic',
+            model: p.models && p.models[0] ? p.models[0].id : 'MiniMax-M2.7-highspeed'
+          };
+        }
+      }
+      // 然后找有 apiKey 的
+      for (const [name, p] of Object.entries(config.models.providers)) {
+        if (p.apiKey) {
+          return {
+            baseUrl: p.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
+            apiKey: p.apiKey,
+            authHeader: false,
+            apiType: 'openai',
+            model: p.models && p.models[0] ? p.models[0].id : 'glm-5'
+          };
+        }
       }
     }
   }
@@ -516,37 +552,35 @@ ${contextText}
 - 如果需要增强："增强：<一句话描述用户想要的增强>"
 - 如果不需要："不需要增强"`;
 
+  // 临时文件清理
+  const tmpFile = '/tmp/autoskill_prompt_' + Date.now() + '.txt';
+  const credsFile = '/tmp/autoskill_creds_' + Date.now() + '.json';
+  const cleanup = () => { try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {} };
+
   try {
-    // 使用临时文件传递prompt，避免引号转义问题
-    const tmpFile = '/tmp/autoskill_prompt_' + Date.now() + '.txt';
-    const credsFile = '/tmp/autoskill_creds_' + Date.now() + '.json';
     writeFileSync(tmpFile, prompt, 'utf-8');
-    
+
     // 获取模型凭证
     const creds = getModelCredentials();
     if (!creds.apiKey) {
-      console.log('[DEBUG] LLM enhancement skipped: no API key available in config or env MINIMAX_API_KEY');
-      try { unlinkSync(tmpFile); } catch(e) {}
+      console.log('[DEBUG] LLM enhancement skipped: no API key available');
+      cleanup();
       return null;
     }
-    const apiKey = creds.apiKey;
-    const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
-    const apiType = creds.apiType || 'anthropic';
-    
-    // 构建请求头并写入临时文件
+
     const headers = {
       'Content-Type': 'application/json'
     };
-    if (apiType === 'anthropic') {
+    if (creds.apiType === 'anthropic') {
       headers['anthropic-version'] = '2023-06-01';
       headers['anthropic-dangerous-direct-browser-access'] = 'true';
     }
     if (creds.authHeader) {
-      headers['Authorization'] = `Bearer ${apiKey}`;
+      headers['Authorization'] = `Bearer ${creds.apiKey}`;
     } else {
-      headers['x-api-key'] = apiKey;
+      headers['x-api-key'] = creds.apiKey;
     }
-    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType, model: creds.model }), 'utf-8');
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl: creds.baseUrl, apiType: creds.apiType, model: creds.model }), 'utf-8');
 
     const result = execSync(`python3 -W ignore -c "
 import requests
@@ -559,66 +593,56 @@ with open('${credsFile}', 'r') as f:
 model = creds.get('model', 'glm-5' if creds.get('apiType') == 'openai' else 'MiniMax-M2.7-highspeed')
 
 if creds.get('apiType') == 'openai':
-    # OpenAI 格式
-    resp = requests.post(
-        creds['baseUrl'] + '/chat/completions',
-        headers=creds['headers'],
-        json={
-            'model': model,
-            'max_tokens': 100,
-            'messages': [{'role': 'user', 'content': prompt}]
-        },
-        timeout=15
-    )
+    resp = requests.post(creds['baseUrl'] + '/chat/completions', headers=creds['headers'],
+        json={'model': model, 'max_tokens': 100, 'messages': [{'role': 'user', 'content': prompt}]}, timeout=15)
     data = resp.json()
     choices = data.get('choices', [])
-    if choices and len(choices) > 0:
-        print(choices[0].get('message', {}).get('content', ''))
-    else:
-        print('ERROR')
+    print(choices[0].get('message', {}).get('content', '') if choices and len(choices) > 0 else 'ERROR')
 else:
-    # Anthropic 格式
-    resp = requests.post(
-        creds['baseUrl'] + '/v1/messages',
-        headers=creds['headers'],
-        json={
-            'model': model,
-            'max_tokens': 100,
-            'messages': [{'role': 'user', 'content': prompt}]
-        },
-        timeout=15
-    )
+    resp = requests.post(creds['baseUrl'] + '/v1/messages', headers=creds['headers'],
+        json={'model': model, 'max_tokens': 100, 'messages': [{'role': 'user', 'content': prompt}]}, timeout=15)
     data = resp.json()
     content = data.get('content', [])
-    if content and len(content) > 0:
-        # 遍历找到 text 类型
-        for c in content:
-            if c.get('type') == 'text':
-                print(c.get('text', ''))
-                break
-        else:
-            print('ERROR')
+    for c in content:
+        if c.get('type') == 'text':
+            print(c.get('text', ''))
+            break
     else:
         print('ERROR')
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
 
-    // 清理临时文件
-    try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {}
+    cleanup(); // 成功后清理
 
     const trimmed = result.trim();
-    console.log('[DEBUG] LLM enhancement check:', trimmed.slice(0, 100));
+    console.log('[DEBUG] LLM enhancement check:', trimmed.slice(0, 150));
 
     if (trimmed === 'ERROR' || trimmed.includes('不需要增强') || trimmed.includes('不需要')) {
       return null;
     }
 
-    // 提取增强内容
-    let enhancement = trimmed;
-    if (trimmed.includes('增强：')) {
-      enhancement = trimmed.split('增强：')[1] || trimmed.split('增强:')[1] || '';
-    }
-    enhancement = enhancement.trim();
+    // 提取增强内容 - 兼容结构化输出
+    let enhancement = '';
+    const trimmedLower = trimmed.toLowerCase();
 
+    // 方式1：精确格式 "增强：xxx"
+    if (trimmed.includes('增强：')) {
+      enhancement = trimmed.split('增强：')[1] || '';
+    } else if (trimmed.includes('增强:')) {
+      enhancement = trimmed.split('增强:')[1] || '';
+    }
+    // 方式2：从结构化分析中提取关键意图
+    else if (trimmedLower.includes('增强') || trimmedLower.includes('改进') || trimmedLower.includes('添加')) {
+      const lines = trimmed.split(/[。\n]/);
+      for (const line of lines) {
+        const lineLower = line.toLowerCase();
+        if (lineLower.includes('增强') || lineLower.includes('改进') || lineLower.includes('添加')) {
+          enhancement = line.replace(/^\d+[.)、：:]\s*/, '').replace(/^[*\-]\s*/, '').trim();
+          if (enhancement.length > 3) break;
+        }
+      }
+    }
+
+    enhancement = enhancement.trim();
     if (!enhancement || enhancement.length < 2) {
       return null;
     }
@@ -628,6 +652,7 @@ else:
 
   } catch(e) {
     console.log('[DEBUG] detectContextScriptModification error:', e.message);
+    cleanup(); // 失败时也清理
     return null;
   }
 }
