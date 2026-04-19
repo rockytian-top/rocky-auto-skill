@@ -106,6 +106,74 @@ function askModelDecision(type, ctx) {
   return rules[type] || { decision:'no' };
 }
 
+// ==================== 反馈处理函数 ====================
+// 获取最近执行的 L3 技能
+let lastExecutedSkill = null; // { cardId, scriptPath, title, currentScript, ts }
+
+function setLastExecutedSkill(cardId, scriptPath, title, currentScript) {
+  lastExecutedSkill = { cardId, scriptPath, title, currentScript, ts: Date.now() };
+}
+
+function getRecentExecutedScript() {
+  if (!lastExecutedSkill) return null;
+  // 5分钟内有效
+  if (Date.now() - lastExecutedSkill.ts > 5 * 60 * 1000) {
+    lastExecutedSkill = null;
+    return null;
+  }
+  return lastExecutedSkill;
+}
+
+// 根据反馈生成新脚本
+function generateScriptFromFeedback(feedback, title, currentScript) {
+  const titleLower = (title || '').toLowerCase();
+  const feedbackLower = (feedback || '').toLowerCase();
+
+  // 分析反馈内容
+  const wantsMore = /还要|加|增加|多|包含|加上/.test(feedback);
+  const wantsDifferent = /不对|不是|应该|不是这样|说错了/.test(feedback);
+  const wantsReplace = /改成|改为|换成|重新|再来/.test(feedback);
+
+  let newScript = currentScript;
+
+  // 内存相关
+  if (titleLower.includes('内存') || titleLower.includes('mem')) {
+    if (wantsMore && (feedbackLower.includes('swap') || feedbackLower.includes('交换'))) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\nfree -h && echo "---" && swapon --show && echo "---" && ps aux --sort=-%mem | head -11';
+    } else if (wantsMore && (feedbackLower.includes('详细') || feedbackLower.includes('更多'))) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\necho "=== 内存使用 ===" && free -h && echo "=== Swap 使用 ===" && swapon --show && echo "=== 进程排名 Top15 ===" && ps aux --sort=-%mem | head -16';
+    } else if (wantsReplace || wantsDifferent) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\necho "free -h 显示内存，ps aux --sort=-%mem | head 显示进程"';
+    }
+  }
+  // CPU相关
+  else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
+    if (wantsMore) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\necho "=== CPU 信息 ===" && lscpu && echo "=== CPU 使用 Top10 ===" && ps aux --sort=-%cpu | head -11';
+    }
+  }
+  // 磁盘相关
+  else if (titleLower.includes('disk') || titleLower.includes('磁盘') || titleLower.includes('硬盘')) {
+    if (wantsMore) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\ndf -h && echo "---" && du -sh /* 2>/dev/null | sort -hr | head -10';
+    }
+  }
+  // 进程相关
+  else if (titleLower.includes('进程') || titleLower.includes('process')) {
+    if (wantsMore) {
+      newScript = '#!/bin/bash\n# Auto-generated skill script\n# Problem: ' + title + '\nps aux && echo "---" && pstree -p && echo "=== 资源使用 Top10 ===" && ps aux --sort=-%mem | head -11';
+    }
+  }
+
+  // 如果没有变化，返回原脚本
+  if (newScript === currentScript) {
+    console.log('[DEBUG] generateScriptFromFeedback: no change needed');
+    return currentScript;
+  }
+
+  return newScript;
+}
+
 // ==================== 工作流模式识别（模型判断） ====================
 const WORKFLOW_DIR = join(process.env.OPENCLAW_STATE_DIR || (process.env.HOME || '/root') + '/.openclaw', '.auto-skill', 'workflows');
 const WORKFLOW_SEQ_TTL = 30 * 60 * 1000; // 30分钟会话窗口
@@ -1183,6 +1251,31 @@ module.exports = {
       ];
       const hasHitIntent = hitIntentPatterns.some(p => p.test(userMsg)) && !hasRecordIntent;
 
+      // ---------- 反馈意图 ----------
+      const feedbackIntentPatterns = [
+        /^\s*不对/,
+        /^\s*不对，/,
+        /^\s*不对，应该/,
+        /^\s*应该还要/,
+        /^\s*应该加/,
+        /^\s*还要加/,
+        /^\s*不对，还要/,
+        /^\s*修改一下/,
+        /^\s*改一下/,
+        /^\s*改一下脚本/,
+        /^\s*更新脚本/,
+        /^\s*脚本不对/,
+        /^\s*结果不对/,
+        /^\s*回答不对/,
+        /^\s*不是这样/,
+        /^\s*不是的/,
+        /^\s*说错了/,
+        /^\s*不对，是/,
+        /^\s*重新/,
+        /^\s*再来一次/
+      ];
+      const hasFeedbackIntent = feedbackIntentPatterns.some(p => p.test(userMsg));
+
       // ========== 执行自然语言命令 ==========
       try {
         // ----- 记录意图 -----
@@ -1282,6 +1375,46 @@ ${hitOutput}
         }
       } catch(e) {
         console.log('[DEBUG] natural language command error:', e.message);
+      }
+
+      // ========== 反馈意图检测：用户说"不对"、"应该还要"等 = 触发脚本优化 ==========
+      if (hasFeedbackIntent) {
+        console.log('[DEBUG] feedback intent detected:', userMsg.slice(0, 50));
+        try {
+          // 从上下文找出最近执行的 L3 技能
+          // 反馈通常是紧跟在技能执行之后，所以找最近的 L3 技能 ID
+          const recentL3Script = getRecentExecutedScript();
+          if (recentL3Script) {
+            const { cardId, scriptPath, title, currentScript } = recentL3Script;
+            console.log('[DEBUG] feedback for skill:', cardId, title);
+
+            // 记录执行失败（帮助后续分析）
+            try {
+              execSync(`bash "${scriptsDir}/autoskill-log" ${cardId} failed`, { timeout: 5000 });
+            } catch(e) {}
+
+            // 根据反馈生成新脚本
+            const newScript = generateScriptFromFeedback(userMsg, title, currentScript);
+            if (newScript && newScript !== currentScript) {
+              // 更新脚本文件
+              writeFileSync(scriptPath, newScript, 'utf-8');
+              chmodSync(scriptPath, 0o755);
+              console.log('[DEBUG] script updated for card:', cardId);
+
+              result.prependContext = `🔧 已根据反馈优化技能脚本：
+📌 技能：${title}
+💬 你的反馈：${userMsg}
+
+新脚本已更新，下次执行会使用新脚本~
+
+---
+`;
+              cache.ts = 0;
+            }
+          }
+        } catch(e) {
+          console.log('[DEBUG] feedback processing error:', e.message);
+        }
       }
 
       // ========== 工作流模式检测（模型分析） ==========
@@ -1460,6 +1593,10 @@ ${hitOutput}
             trigger: r.trigger,
             ...execResult
           });
+
+          // 记录最近执行的技能（用于反馈优化）
+          const currentScript = existsSync(scriptPath) ? readFileSync(scriptPath, 'utf-8') : '';
+          setLastExecutedSkill(r.id, scriptPath, r.title, currentScript);
 
           // 记录执行结果（方案E）
           try {
