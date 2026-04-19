@@ -33,28 +33,19 @@ function getGatewayConfig() {
 }
 
 function getModelCredentials() {
-  // 优先使用环境变量中的OAuth token（网关正常运行minimax的关键）
-  const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
-  if (authToken) {
-    return {
-      baseUrl: process.env.ANTHROPIC_BASE_URL || 'https://api.minimaxi.com/anthropic',
-      apiKey: authToken,
-      authHeader: true,  // 使用 Bearer token
-      apiType: 'anthropic'
-    };
-  }
-
-  // 从网关配置读取模型凭证
+  // 从网关配置读取模型凭证和模型名称
   const config = getGatewayConfig();
   if (config && config.models && config.models.providers) {
-    // 优先使用有完整配置的 provider（baseUrl + apiKey）
+    // 优先使用 zai（有 apiKey 的 provider）
     const zai = config.models.providers['zai'];
     if (zai && zai.apiKey) {
+      const modelId = zai.models && zai.models[0] ? zai.models[0].id : 'glm-5';
       return {
         baseUrl: zai.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
         apiKey: zai.apiKey,
         authHeader: false,
-        apiType: 'openai'
+        apiType: 'openai',
+        model: modelId
       };
     }
     // minimax-portal 或其他 provider
@@ -62,11 +53,27 @@ function getModelCredentials() {
     for (const name of providerNames) {
       const p = config.models.providers[name];
       if (p && (p.apiKey || p.authHeader)) {
+        const modelId = p.models && p.models[0] ? p.models[0].id : 'MiniMax-M2.7-highspeed';
         return {
           baseUrl: p.baseUrl || 'https://api.minimaxi.com/anthropic',
           apiKey: p.apiKey || '',
           authHeader: p.authHeader || false,
-          apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic'
+          apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic',
+          model: modelId
+        };
+      }
+    }
+    // provider 没有 apiKey 但有 authHeader（OAuth）
+    for (const name of providerNames) {
+      const p = config.models.providers[name];
+      if (p && p.authHeader && !p.apiKey) {
+        const modelId = p.models && p.models[0] ? p.models[0].id : 'MiniMax-M2.7-highspeed';
+        return {
+          baseUrl: p.baseUrl || 'https://api.minimaxi.com/anthropic',
+          apiKey: process.env.ANTHROPIC_AUTH_TOKEN || '',
+          authHeader: true,
+          apiType: 'anthropic',
+          model: modelId
         };
       }
     }
@@ -75,9 +82,10 @@ function getModelCredentials() {
   // 回退到环境变量
   return {
     baseUrl: process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic',
-    apiKey: process.env.MINIMAX_API_KEY || '',
-    authHeader: false,
-    apiType: 'anthropic'
+    apiKey: process.env.MINIMAX_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || '',
+    authHeader: !!process.env.ANTHROPIC_AUTH_TOKEN,
+    apiType: 'anthropic',
+    model: 'MiniMax-M2.7-highspeed'
   };
 }
 
@@ -538,8 +546,8 @@ ${contextText}
     } else {
       headers['x-api-key'] = apiKey;
     }
-    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType }), 'utf-8');
-    
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType, model: creds.model }), 'utf-8');
+
     const result = execSync(`python3 -W ignore -c "
 import requests
 import json
@@ -548,13 +556,15 @@ with open('${tmpFile}', 'r') as f:
 with open('${credsFile}', 'r') as f:
     creds = json.load(f)
 
+model = creds.get('model', 'glm-5' if creds.get('apiType') == 'openai' else 'MiniMax-M2.7-highspeed')
+
 if creds.get('apiType') == 'openai':
     # OpenAI 格式
     resp = requests.post(
         creds['baseUrl'] + '/chat/completions',
         headers=creds['headers'],
         json={
-            'model': 'glm-5.1',
+            'model': model,
             'max_tokens': 100,
             'messages': [{'role': 'user', 'content': prompt}]
         },
@@ -572,7 +582,7 @@ else:
         creds['baseUrl'] + '/v1/messages',
         headers=creds['headers'],
         json={
-            'model': 'MiniMax-M2.7-highspeed',
+            'model': model,
             'max_tokens': 100,
             'messages': [{'role': 'user', 'content': prompt}]
         },
@@ -685,7 +695,7 @@ ${scriptBody}
     } else {
       headers['x-api-key'] = apiKey;
     }
-    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType }), 'utf-8');
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType, model: creds.model }), 'utf-8');
     
     const result = execSync(`python3 -W ignore -c "
 import requests
@@ -695,13 +705,15 @@ with open('${tmpFile}', 'r') as f:
 with open('${credsFile}', 'r') as f:
     creds = json.load(f)
 
+model = creds.get('model', 'glm-5.1' if creds.get('apiType') == 'openai' else 'MiniMax-M2.7-highspeed')
+
 if creds.get('apiType') == 'openai':
     # OpenAI 格式
     resp = requests.post(
         creds['baseUrl'] + '/chat/completions',
         headers=creds['headers'],
         json={
-            'model': 'glm-5.1',
+            'model': model,
             'max_tokens': 500,
             'messages': [{'role': 'user', 'content': prompt}]
         },
@@ -719,7 +731,7 @@ else:
         creds['baseUrl'] + '/v1/messages',
         headers=creds['headers'],
         json={
-            'model': 'MiniMax-M2.7-highspeed',
+            'model': model,
             'max_tokens': 500,
             'messages': [{'role': 'user', 'content': prompt}]
         },
@@ -1062,6 +1074,7 @@ ${statsText}
 
     // 构建Python脚本
     const escapedPrompt = prompt.replace(/'/g, "\\'");
+    const modelName = creds.model || 'MiniMax-M2.7-highspeed';
     const pythonScript = `
 import requests
 import json
@@ -1069,7 +1082,7 @@ resp = requests.post(
     '${creds.baseUrl}/v1/messages',
     headers=${JSON.stringify(headers)},
     json={
-        'model': 'MiniMax-M2.7-highspeed',
+        'model': '${modelName}',
         'max_tokens': 2000,
         'messages': [{'role': 'user', 'content': '${escapedPrompt}'}]
     },
@@ -1201,13 +1214,14 @@ ${skillStats || '(无技能数据)'}
 
     // 构建Python脚本
     const escapedPrompt = prompt.replace(/'/g, "\\'");
+    const modelName = creds.model || 'MiniMax-M2.7-highspeed';
     const pythonScript = `
 import requests
 resp = requests.post(
     '${creds.baseUrl}/v1/messages',
     headers=${JSON.stringify(headers)},
     json={
-        'model': 'MiniMax-M2.7-highspeed',
+        'model': '${modelName}',
         'max_tokens': 2000,
         'messages': [{'role': 'user', 'content': '${escapedPrompt}'}]
     },
