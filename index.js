@@ -32,17 +32,26 @@ function getGatewayConfig() {
   return null;
 }
 
-// 模块级变量，存储当前 sessionKey（在 before_agent_start 中设置）
+// 模块级变量，存储当前 sessionKey、prompt 和检测到的 agent model（在 before_agent_start 中设置）
 let _currentSessionKey = null;
+let _currentPrompt = null;
+let _detectedAgentModel = null; // 存储检测到的 agent model，供异步调用使用
 
 // 从 sessionKey 解析 agent 名称并获取其 model
 // sessionKey 格式: agent:xiaoying:onebot:xxx 或 agent:fs-daying:main
 function getAgentModelFromSession(sessionKey) {
-  if (!sessionKey) return null;
+  if (!sessionKey) {
+    console.log('[DEBUG] getAgentModelFromSession: sessionKey is null');
+    return null;
+  }
   // 格式: agent:agentName:...
   const match = sessionKey.match(/^agent:([^:]+):/);
-  if (!match) return null;
+  if (!match) {
+    console.log('[DEBUG] getAgentModelFromSession: sessionKey format mismatch, key:', sessionKey);
+    return null;
+  }
   const agentName = match[1];
+  console.log('[DEBUG] getAgentModelFromSession: extracted agentName:', agentName);
 
   const config = getGatewayConfig();
   if (!config || !config.agents || !config.agents.list) return null;
@@ -51,24 +60,74 @@ function getAgentModelFromSession(sessionKey) {
   for (const agent of config.agents.list) {
     if (agent.id === agentName || agent.name === agentName) {
       if (agent.model && agent.model.includes('/')) {
+        console.log('[DEBUG] getAgentModelFromSession: found model:', agent.model);
         return agent.model;
       }
     }
   }
+  console.log('[DEBUG] getAgentModelFromSession: agent found but no model');
   return null;
 }
 
-function getModelCredentials(agentModel) {
-  // agentModel 格式: "provider/model" 如 "minimax-portal/MiniMax-M2.7-highspeed"
-  // 优先使用 agent 实际使用的模型，保持一致
-  const config = getGatewayConfig();
+// 从 prompt 中检测当前 agent 的 model
+// 通过 prompt 内容识别渠道和发送者，推断使用哪个 agent
+function detectAgentModelFromPrompt(promptStr) {
+  if (!promptStr || typeof promptStr !== 'string') return null;
 
-  // 如果没有提供 agentModel，尝试从当前 sessionKey 获取
-  if (!agentModel && _currentSessionKey) {
-    agentModel = getAgentModelFromSession(_currentSessionKey);
+  const config = getGatewayConfig();
+  if (!config || !config.agents || !config.agents.list) return null;
+
+  // 从 config.bindings 查找当前 channel 对应的 agent
+  // bindings 格式: [{ agentId: "xiaoying", match: { channel: "onebot" } }]
+  // 从 prompt 中提取 channel 信息
+  const channelMatch = promptStr.match(/channel["\s:]+(\w+)/i);
+  const channel = channelMatch ? channelMatch[1] : null;
+
+  if (channel && config.bindings) {
+    const binding = config.bindings.find(b => b.match && b.match.channel === channel);
+    if (binding && binding.agentId) {
+      const agent = config.agents.list.find(a => a.id === binding.agentId);
+      if (agent && agent.model && agent.model.includes('/')) {
+        return agent.model;
+      }
+    }
   }
 
-  // 如果提供了 agentModel，解析出 provider
+  // 回退到读取第一个有 model 配置的 agent
+  for (const agent of config.agents.list) {
+    if (agent.model && agent.model.includes('/')) {
+      return agent.model;
+    }
+  }
+
+  return null;
+}
+
+function getModelCredentials(agentModel, promptOverride) {
+  // agentModel 格式: "provider/model" 如 "minimax-portal/MiniMax-M2.7-highspeed"
+  const config = getGatewayConfig();
+  const effectivePrompt = promptOverride || _currentPrompt;
+  console.log('[DEBUG] getModelCredentials called, agentModel:', agentModel);
+
+  // 如果没有提供 agentModel，尝试从 sessionKey、prompt 或已检测的 model 获取
+  if (!agentModel) {
+    if (_currentSessionKey) agentModel = getAgentModelFromSession(_currentSessionKey);
+    if (!agentModel && effectivePrompt) agentModel = detectAgentModelFromPrompt(effectivePrompt);
+    // 兜底：使用之前检测到的 agent model（防止 async 调用期间被覆盖）
+    if (!agentModel && _detectedAgentModel) agentModel = _detectedAgentModel;
+    // 最终兜底：使用配置中第一个有 model 的 agent
+    if (!agentModel && config && config.agents && config.agents.list) {
+      for (const agent of config.agents.list) {
+        if (agent.model && agent.model.includes('/')) {
+          agentModel = agent.model;
+          console.log('[DEBUG] using first available agent model as fallback:', agentModel);
+          break;
+        }
+      }
+    }
+  }
+
+  // 解析 provider 和 model
   let targetProvider = null;
   let targetModel = null;
   if (agentModel && agentModel.includes('/')) {
@@ -77,7 +136,7 @@ function getModelCredentials(agentModel) {
     targetModel = parts[1];
   }
 
-  // 尝试从 agents 配置中找到实际使用的 model
+  // 如果没有 targetProvider，从 agents 配置中获取第一个有 model 的
   if (!targetProvider && config && config.agents && config.agents.list) {
     for (const agent of config.agents.list) {
       if (agent.model && agent.model.includes('/')) {
@@ -89,65 +148,55 @@ function getModelCredentials(agentModel) {
     }
   }
 
-  // 优先尝试环境变量（OAuth token，用户启动网关时配置）
-  // 这些是最常用的 LLM API 环境变量
-  const envVars = [
-    'ANTHROPIC_AUTH_TOKEN',  // minimax OAuth
-    'OPENAI_API_KEY',
-    'API_KEY',
-    'MINIMAX_API_KEY'
-  ];
-  for (const varName of envVars) {
-    const token = process.env[varName];
-    if (token && token.length > 10) {
-      // 确定 API 类型
-      let apiType = 'anthropic';
-      let baseUrl = 'https://api.minimaxi.com/anthropic';
-      if (varName === 'OPENAI_API_KEY' || varName === 'API_KEY') {
-        apiType = 'openai';
-        baseUrl = 'https://api.openai.com/v1';
-      }
-      // 如果有 provider 配置，使用其 baseUrl
-      if (targetProvider && config && config.models && config.models.providers) {
-        const provider = config.models.providers[targetProvider];
-        if (provider && provider.baseUrl) {
-          baseUrl = provider.baseUrl;
-        }
-      }
-      const modelId = targetModel || 'MiniMax-M2.7-highspeed';
+  // 策略：优先用 provider 的 apiKey（API key 模式），其次用环境变量（OAuth 模式）
+  // 优先级：targetProvider > 任意有 apiKey 的 provider > 环境变量
+  const oauthToken = process.env.ANTHROPIC_AUTH_TOKEN || null;
+  const openaiToken = (process.env.OPENAI_API_KEY || process.env.API_KEY || null);
+
+  // 优先：targetProvider 有自己的 apiKey
+  if (targetProvider && config && config.models && config.models.providers) {
+    const provider = config.models.providers[targetProvider];
+    if (provider && provider.apiKey) {
+      const modelId = targetModel || (provider.models && provider.models[0] ? provider.models[0].id : null);
+      console.log('[DEBUG] using targetProvider apiKey, model:', modelId);
       return {
-        baseUrl,
-        apiKey: token,
-        authHeader: true,
-        apiType,
+        baseUrl: provider.baseUrl || 'https://api.minimaxi.com/anthropic',
+        apiKey: provider.apiKey,
+        authHeader: false,
+        apiType: (provider.api && provider.api.includes('openai')) ? 'openai' : 'anthropic',
         model: modelId
       };
     }
   }
 
-  // 回退：从 openclaw.json 读取
-  if (config && config.models && config.models.providers) {
-    // 使用 targetProvider 的配置
-    if (targetProvider) {
-      const provider = config.models.providers[targetProvider];
-      if (provider && provider.apiKey) {
-        const modelId = targetModel || (provider.models && provider.models[0] ? provider.models[0].id : null);
-        return {
-          baseUrl: provider.baseUrl || 'https://api.minimaxi.com/anthropic',
-          apiKey: provider.apiKey,
-          authHeader: false,
-          apiType: (provider.api && provider.api.includes('openai')) ? 'openai' : 'anthropic',
-          model: modelId || 'MiniMax-M2.7-highspeed'
-        };
-      }
+  // 其次：targetProvider 是 OAuth 模式（有 authHeader: true 但无 apiKey）
+  if (targetProvider && config && config.models && config.models.providers) {
+    const provider = config.models.providers[targetProvider];
+    if (provider && provider.authHeader === true && !provider.apiKey && oauthToken) {
+      const modelId = targetModel || (provider.models && provider.models[0] ? provider.models[0].id : null);
+      console.log('[DEBUG] using OAuth token, model:', modelId);
+      return {
+        baseUrl: provider.baseUrl || 'https://api.minimaxi.com/anthropic',
+        apiKey: oauthToken,
+        authHeader: true,
+        apiType: 'anthropic',
+        model: modelId
+      };
     }
-    // 兜底：遍历 providers，找有 apiKey 的
+  }
+
+  // 兜底：找任意一个有有效 apiKey 的 provider（允许回退到其他 provider，包括 OAuth provider 无 token 时）
+  if (config && config.models && config.models.providers) {
     for (const [name, p] of Object.entries(config.models.providers)) {
-      if (p.apiKey) {
-        const modelId = p.models && p.models[0] ? p.models[0].id : 'glm-5';
+      const apiKeyStr = p.apiKey;
+      const isValidApiKey = apiKeyStr && typeof apiKeyStr === 'string' && apiKeyStr.trim().length > 0;
+      console.log('[DEBUG] fallback provider check:', name, 'apiKey present:', !!apiKeyStr, 'apiKey length:', typeof apiKeyStr === 'string' ? apiKeyStr.length : 'N/A', 'isValid:', isValidApiKey);
+      if (isValidApiKey) {
+        const modelId = p.models && p.models[0] ? p.models[0].id : null;
+        console.log('[DEBUG] using fallback provider:', name, 'model:', modelId, 'apiKey len:', apiKeyStr.length);
         return {
           baseUrl: p.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
-          apiKey: p.apiKey,
+          apiKey: apiKeyStr,
           authHeader: false,
           apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic',
           model: modelId
@@ -156,14 +205,30 @@ function getModelCredentials(agentModel) {
     }
   }
 
-  // 无法获取凭证
-  return {
-    baseUrl: '',
-    apiKey: '',
-    authHeader: false,
-    apiType: 'anthropic',
-    model: ''
-  };
+  // 最后：使用环境变量（无 targetProvider）
+  if (oauthToken) {
+    console.log('[DEBUG] using OAuth env var as last resort');
+    return {
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      apiKey: oauthToken,
+      authHeader: true,
+      apiType: 'anthropic',
+      model: targetModel
+    };
+  }
+  if (openaiToken) {
+    console.log('[DEBUG] using OpenAI env var as last resort');
+    return {
+      baseUrl: 'https://api.openai.com/v1',
+      apiKey: openaiToken,
+      authHeader: false,
+      apiType: 'openai',
+      model: 'gpt-4o-mini'
+    };
+  }
+
+  console.log('[DEBUG] getModelCredentials: no credentials found');
+  return { baseUrl: '', apiKey: '', authHeader: false, apiType: 'anthropic', model: '' };
 }
 
 // ==================== 脚本版本备份 ====================
@@ -543,13 +608,68 @@ function findRecentSkillFromMessages(messages, scriptsDir, skillsDir) {
   return null;
 }
 
+// ==================== 基于规则的脚本增强 ====================
+/**
+ * 根据用户反馈关键词，应用规则增强脚本
+ * 返回增强描述，如果规则不匹配则返回 null
+ */
+function applyRuleBasedEnhancement(userMsg, currentScript, title) {
+  if (!userMsg || !currentScript) return null;
+
+  const msg = userMsg.toLowerCase();
+  const titleLower = title.toLowerCase();
+
+  // 规则表：匹配模式 -> 增强描述
+  const rules = [
+    // 在线用户数
+    { patterns: [/在线用户|当前用户|who命令|登录用户|活跃用户/i], enhancement: '显示在线用户数（who | wc -l）' },
+    // 运行时间
+    { patterns: [/运行时间|uptime|开机时间|运行时长|启动了多久/i], enhancement: '显示系统运行时间（uptime）' },
+    // CPU 信息
+    { patterns: [/cpu信息|cpu详情|处理器信息|lscpu/i], enhancement: '显示 CPU 详细信息（lscpu）' },
+    // 进程过滤
+    { patterns: [/过滤.*进程|去掉.*进程|只看用户进程|排除系统进程/i], enhancement: '过滤掉系统进程，只显示用户进程' },
+    // 排序
+    { patterns: [/按.*排序|从高到低|从大到小/i], enhancement: '按 CPU 或内存使用率排序' },
+    // Top N
+    { patterns: [/top10|top15|前.*个|排名前/i], enhancement: '显示前10-15个进程' },
+    // 内存详情
+    { patterns: [/内存详情|swap|交换分区|虚拟内存/i], enhancement: '显示内存和 swap 使用情况' },
+    // 磁盘使用
+    { patterns: [/磁盘使用|硬盘使用|df.*h|目录占用/i], enhancement: '显示磁盘使用情况和目录占用' },
+    // 网络连接
+    { patterns: [/网络连接|端口|netstat|监听端口|连接数/i], enhancement: '显示网络连接和端口监听情况' },
+    // 简化输出
+    { patterns: [/只.*主要|只看|只显示.*重要/i], enhancement: '简化输出，只显示关键信息' },
+    // 详细输出
+    { patterns: [/详细|完整|更多.*信息/i], enhancement: '显示更详细的输出' },
+  ];
+
+  for (const rule of rules) {
+    for (const pattern of rule.patterns) {
+      if (pattern.test(msg)) {
+        return { enhancement: rule.enhancement };
+      }
+    }
+  }
+
+  return null;
+}
+
 // ==================== 上下文感知的脚本修改检测（Hermes式 - 模型驱动） ====================
-function detectContextScriptModification(userMsg, messages, recentSkill, scriptsDir, skillsDir) {
-  // 如果没有直接的 recentSkill，尝试从消息历史中找最近讨论过的技能
+function detectContextScriptModification(userMsg, messages, recentSkill, scriptsDir, skillsDir, promptOverride) {
+  // 优先使用传入的 recentSkill，其次从持久化存储获取，最后从消息历史查找
+  if (!recentSkill) {
+    recentSkill = getRecentExecutedScript();
+    if (recentSkill) {
+      console.log('[DEBUG] detectContextScriptModification: found skill from recent executed:', recentSkill.cardId, recentSkill.title);
+    }
+  }
+  // 如果还是没有，从消息历史中找最近讨论过的技能
   if (!recentSkill) {
     recentSkill = findRecentSkillFromMessages(messages, scriptsDir, skillsDir);
     if (!recentSkill) {
-      console.log('[DEBUG] detectContextScriptModification: no recent skill found in messages');
+      console.log('[DEBUG] detectContextScriptModification: no recent skill found');
       return null;
     }
     console.log('[DEBUG] detectContextScriptModification: found skill from messages:', recentSkill.cardId, recentSkill.title);
@@ -562,6 +682,14 @@ function detectContextScriptModification(userMsg, messages, recentSkill, scripts
     return null;
   }
 
+  // ========== 先尝试基于规则的增强 ==========
+  const ruleResult = applyRuleBasedEnhancement(userMsg, currentScript, title);
+  if (ruleResult) {
+    console.log('[DEBUG] rule-based enhancement found:', ruleResult.enhancement);
+    return { cardId, scriptPath, title, currentScript, enhancement: ruleResult.enhancement };
+  }
+
+  // ========== 使用 LLM 增强 ==========
   // 构建对话上下文
   const recentMessages = (messages || []).slice(-6);
   const contextText = recentMessages.map(m => {
@@ -570,28 +698,16 @@ function detectContextScriptModification(userMsg, messages, recentSkill, scripts
     return `${role}: ${content}`;
   }).join('\n');
 
-  // 构建LLM prompt，让模型判断是否需要增强
-  const prompt = `你是技能增强判断专家。
+  // 构建LLM prompt，让模型判断是否需要增强脚本
+  const prompt = `技能：${title}
+当前脚本：${currentScript.substring(0, 200)}
+用户消息：${userMsg}
 
-当前技能：${title}
-当前脚本：
-${currentScript}
+用户是否要求修改或增强这个脚本？比如用户说"还要显示"、"加上"、"添加"、"增加"等，都是要求增强。
+如果用户要求修改脚本，请直接输出修改要求（30字以内）。
+如果用户没有要求修改脚本，只输出"不需要"。
 
-最近对话：
-${contextText}
-
-用户最新消息：${userMsg}
-
-判断：用户是否想要增强这个技能？（比如：添加功能、补充信息、改进输出等）
-
-请仔细分析对话上下文，理解用户的真实意图。
-
-如果用户确实想要增强技能，请提取他们想要什么增强内容（用一句话描述）。
-如果用户不是要增强技能，请回答"不需要增强"。
-
-回答格式：
-- 如果需要增强："增强：<一句话描述用户想要的增强>"
-- 如果不需要："不需要增强"`;
+直接回复（只输出一行）：`;
 
   // 临时文件清理
   const tmpFile = '/tmp/autoskill_prompt_' + Date.now() + '.txt';
@@ -601,10 +717,10 @@ ${contextText}
   try {
     writeFileSync(tmpFile, prompt, 'utf-8');
 
-    // 获取模型凭证
-    const creds = getModelCredentials();
-    if (!creds.apiKey) {
-      console.log('[DEBUG] LLM enhancement skipped: no API key available');
+    // 获取模型凭证（传入 promptOverride 防止 async 调用期间被覆盖）
+    const creds = getModelCredentials(null, promptOverride);
+    if (!creds.apiKey || !creds.model) {
+      console.log('[DEBUG] LLM enhancement skipped: no valid credentials, apiKey:', !!creds.apiKey, 'model:', creds.model);
       cleanup();
       return null;
     }
@@ -621,28 +737,43 @@ ${contextText}
     } else {
       headers['x-api-key'] = creds.apiKey;
     }
-    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl: creds.baseUrl, apiType: creds.apiType, model: creds.model }), 'utf-8');
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl: creds.baseUrl, apiType: creds.apiType, model: creds.model, apiKey: creds.apiKey }), 'utf-8');
 
     const result = execSync(`python3 -W ignore -c "
 import requests
 import json
+import sys
 with open('${tmpFile}', 'r') as f:
     prompt = f.read()
 with open('${credsFile}', 'r') as f:
     creds = json.load(f)
 
-model = creds.get('model', 'glm-5' if creds.get('apiType') == 'openai' else 'MiniMax-M2.7-highspeed')
+sys.stderr.write('DEBUG creds received:' + json.dumps({'model': creds.get('model'), 'baseUrl': creds.get('baseUrl'), 'apiType': creds.get('apiType'), 'apiKey_len': len(creds.get('apiKey', ''))}) + '\\n')
+
+model = creds.get('model')
+if not model:
+    print('ERROR')
+    sys.exit(0)
+sys.stderr.write('DEBUG:model=' + str(model) + ' baseUrl=' + str(creds.get('baseUrl')) + ' apiType=' + str(creds.get('apiType')) + '\\n')
 
 if creds.get('apiType') == 'openai':
     resp = requests.post(creds['baseUrl'] + '/chat/completions', headers=creds['headers'],
         json={'model': model, 'max_tokens': 100, 'messages': [{'role': 'user', 'content': prompt}]}, timeout=15)
     data = resp.json()
     choices = data.get('choices', [])
-    print(choices[0].get('message', {}).get('content', '') if choices and len(choices) > 0 else 'ERROR')
+    if choices and len(choices) > 0:
+        msg = choices[0].get('message', {})
+        # 优先用 content，推理模型用 reasoning_content
+        output = msg.get('content', '') or msg.get('reasoning_content', '') or ''
+    else:
+        output = 'ERROR'
+    sys.stderr.write('DEBUG:openai_response=' + output[:50] + '\\n')
+    print(output)
 else:
     resp = requests.post(creds['baseUrl'] + '/v1/messages', headers=creds['headers'],
         json={'model': model, 'max_tokens': 100, 'messages': [{'role': 'user', 'content': prompt}]}, timeout=15)
     data = resp.json()
+    sys.stderr.write('DEBUG:anthropic_response=' + str(data)[:100] + '\\n')
     content = data.get('content', [])
     for c in content:
         if c.get('type') == 'text':
@@ -655,38 +786,37 @@ else:
     cleanup(); // 成功后清理
 
     const trimmed = result.trim();
-    console.log('[DEBUG] LLM enhancement check:', trimmed.slice(0, 150));
+    console.log('[DEBUG] LLM enhancement check:', trimmed.slice(0, 300));
 
-    if (trimmed === 'ERROR' || trimmed.includes('不需要增强') || trimmed.includes('不需要')) {
+    // 如果回复包含"不需要"，说明不需要增强
+    if (trimmed === 'ERROR' || trimmed.includes('不需要')) {
       return null;
     }
 
-    // 提取增强内容 - 兼容结构化输出
-    let enhancement = '';
-    const trimmedLower = trimmed.toLowerCase();
+    // 检查用户消息是否暗示需要增强（还要/加上/添加/显示等）
+    const userMsgLower = userMsg.toLowerCase();
+    const impliesEnhancement = /还要|加上|添加|增加|显示|也要|再说|再问/.test(userMsgLower);
 
-    // 方式1：精确格式 "增强：xxx"
-    if (trimmed.includes('增强：')) {
-      enhancement = trimmed.split('增强：')[1] || '';
-    } else if (trimmed.includes('增强:')) {
-      enhancement = trimmed.split('增强:')[1] || '';
+    if (!impliesEnhancement) {
+      return null;
     }
-    // 方式2：从结构化分析中提取关键意图
-    else if (trimmedLower.includes('增强') || trimmedLower.includes('改进') || trimmedLower.includes('添加')) {
-      const lines = trimmed.split(/[。\n]/);
-      for (const line of lines) {
-        const lineLower = line.toLowerCase();
-        if (lineLower.includes('增强') || lineLower.includes('改进') || lineLower.includes('添加')) {
-          enhancement = line.replace(/^\d+[.)、：:]\s*/, '').replace(/^[*\-]\s*/, '').trim();
-          if (enhancement.length > 3) break;
-        }
+
+    // 用户暗示需要增强，提取可能的增强内容
+    // 如果回复中有"用户消息"字样，说明是分析文本，从中提取用户消息内容作为增强需求
+    let enhancement = '';
+    if (trimmed.includes('用户消息') || trimmed.includes('用户说')) {
+      const match = trimmed.match(/用户[消息说][：:]\s*[""']?([^""'\n]+)[""']?/);
+      if (match) {
+        enhancement = match[1].trim();
       }
     }
 
-    enhancement = enhancement.trim();
+    // 如果没有提取到，使用用户原始消息
     if (!enhancement || enhancement.length < 2) {
-      return null;
+      enhancement = userMsg;
     }
+
+    console.log('[DEBUG] LLM detected enhancement intent:', enhancement);
 
     console.log('[DEBUG] LLM detected enhancement intent:', enhancement);
     return { cardId, scriptPath, title, currentScript, enhancement };
@@ -698,8 +828,77 @@ else:
   }
 }
 
-// ==================== 智能脚本增强（模型驱动） ====================
-function applyScriptEnhancement(title, currentScript, enhancement) {
+// ==================== 基于规则的脚本修改 ====================
+function applyRuleBasedScript(currentScript, enhancement) {
+  if (!currentScript || !enhancement) return null;
+
+  // 从 enhancement 描述中提取要添加的内容
+  const enhancementLower = enhancement.toLowerCase();
+
+  // 规则：提取括号中的命令
+  const cmdMatch = enhancement.match(/（([^）]+)）/);
+  const addCmd = cmdMatch ? cmdMatch[1].trim() : null;
+
+  // 检查脚本是否已经包含这个命令
+  if (addCmd && currentScript.includes(addCmd.split('|')[0].trim())) {
+    console.log('[DEBUG] rule-based: script already contains', addCmd.split('|')[0]);
+    return null;
+  }
+
+  // 根据 enhancement 决定如何修改脚本
+  let newScript = currentScript;
+
+  // 在线用户数：添加 who | wc -l
+  if (enhancementLower.includes('在线用户') || enhancementLower.includes('who')) {
+    const whoCmd = 'echo "=== 在线用户 ===" && who';
+    if (!currentScript.includes('who')) {
+      newScript = currentScript.replace(/\n$/, '') + '\n' + whoCmd;
+    }
+  }
+
+  // 运行时间：已有 uptime
+  if (enhancementLower.includes('运行时间') || enhancementLower.includes('uptime')) {
+    const uptimeCmd = 'echo "=== 运行时间 ===" && uptime';
+    if (!currentScript.includes('uptime')) {
+      newScript = newScript.replace(/\n$/, '') + '\n' + uptimeCmd;
+    }
+  }
+
+  // CPU 信息：添加 lscpu
+  if (enhancementLower.includes('cpu信息') || enhancementLower.includes('lscpu')) {
+    const lscpuCmd = 'echo "=== CPU 信息 ===" && lscpu';
+    if (!currentScript.includes('lscpu')) {
+      newScript = newScript.replace(/\n$/, '') + '\n' + lscpuCmd;
+    }
+  }
+
+  // 内存详情：添加 free -h
+  if (enhancementLower.includes('内存') && enhancementLower.includes('详情')) {
+    const freeCmd = 'echo "=== 内存详情 ===" && free -h';
+    if (!currentScript.includes('free -h')) {
+      newScript = newScript.replace(/\n$/, '') + '\n' + freeCmd;
+    }
+  }
+
+  // 进程过滤：添加 grep -v
+  if (enhancementLower.includes('过滤') && enhancementLower.includes('进程')) {
+    // 假设原脚本有 ps aux，在其后面加 grep -v
+    if (currentScript.includes('ps aux')) {
+      newScript = currentScript.replace(/ps aux/g, 'ps aux | grep -v "\\[.*\\]"');
+    }
+  }
+
+  // 如果脚本没有变化，返回 null
+  if (newScript === currentScript) {
+    return null;
+  }
+
+  return newScript;
+}
+
+// ==================== 智能脚本增强（AI 根据上下文修改） ====================
+function applyScriptEnhancement(title, currentScript, enhancement, agentModel) {
+  // 使用 LLM 根据上下文增强脚本
   // 提取shebang和注释
   const lines = currentScript.split('\n');
   const shebangLines = [];
@@ -719,23 +918,27 @@ function applyScriptEnhancement(title, currentScript, enhancement) {
   const problem = problemMatch ? problemMatch[1].trim() : (title || '未知问题');
 
   // 构建prompt让模型决定如何增强
-  const prompt = `你是一个Linux shell脚本专家。
+  let prompt;
+  if (enhancement && enhancement.trim().length > 0) {
+    prompt = `你是一个shell脚本专家。只输出脚本代码，不要输出任何解释、思考过程或markdown格式。
 
 当前脚本：
 ${scriptBody}
 
-用户想要增强："${enhancement}"
+用户要求：${enhancement}
 
-问题背景：${problem}
+直接输出修改后的脚本（保留shebang，只修改body部分）：`;
+  } else {
+    // enhancement 为空，根据上下文智能判断需要什么增强
+    prompt = `你是一个shell脚本专家。只输出脚本代码，不要输出任何解释、思考过程或markdown格式。
 
-请生成增强后的完整shell脚本（保留shebang和注释，只修改脚本body）。
-要求：
-1. 在原脚本基础上智能增强，不要完全重写
-2. 添加用户要求的增强功能
-3. 用 && 或 || 连接多个命令
-4. 只输出脚本内容，不要解释
+当前脚本：
+${scriptBody}
 
-输出格式：直接输出脚本内容`;
+用户要求增强此脚本。
+
+直接输出修改后的脚本（保留shebang，只修改body部分）：`;
+  }
 
   try {
     // 使用临时文件传递prompt，避免引号转义问题
@@ -743,10 +946,10 @@ ${scriptBody}
     const credsFile = '/tmp/autoskill_creds_' + Date.now() + '.json';
     writeFileSync(tmpFile, prompt, 'utf-8');
     
-    // 获取模型凭证
-    const creds = getModelCredentials();
-    if (!creds.apiKey) {
-      console.log('[DEBUG] LLM enhancement skipped: no API key available in config or env MINIMAX_API_KEY');
+    // 获取模型凭证（优先使用传入的 agentModel）
+    const creds = getModelCredentials(agentModel || null);
+    if (!creds.apiKey || !creds.model) {
+      console.log('[DEBUG] LLM enhancement skipped: no valid credentials, apiKey:', !!creds.apiKey, 'model:', creds.model);
       try { unlinkSync(tmpFile); } catch(e) {}
       return null;
     }
@@ -767,7 +970,7 @@ ${scriptBody}
     } else {
       headers['x-api-key'] = apiKey;
     }
-    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType, model: creds.model }), 'utf-8');
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl, apiType, model: creds.model, apiKey }), 'utf-8');
     
     const result = execSync(`python3 -W ignore -c "
 import requests
@@ -777,7 +980,10 @@ with open('${tmpFile}', 'r') as f:
 with open('${credsFile}', 'r') as f:
     creds = json.load(f)
 
-model = creds.get('model', 'glm-5.1' if creds.get('apiType') == 'openai' else 'MiniMax-M2.7-highspeed')
+model = creds.get('model')
+if not model:
+    print('ERROR')
+    sys.exit(0)
 
 if creds.get('apiType') == 'openai':
     # OpenAI 格式
@@ -794,7 +1000,9 @@ if creds.get('apiType') == 'openai':
     data = resp.json()
     choices = data.get('choices', [])
     if choices and len(choices) > 0:
-        print(choices[0].get('message', {}).get('content', ''))
+        msg = choices[0].get('message', {})
+        content = msg.get('content', '') or msg.get('reasoning_content', '') or ''
+        print(content)
     else:
         print('ERROR')
 else:
@@ -832,17 +1040,40 @@ else:
     // 清理临时文件
     try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {}
 
-    // 重建完整脚本（保留shebang和注释）
-    const newBody = trimmed.replace(/^#!/,'echo "skip" && #!').split('\n').filter(l => !l.match(/^echo "skip"/)).join('\n');
+    // 过滤非脚本内容（移除解释性文字、markdown格式等）
+    const lines = trimmed.split('\n');
+    const scriptLines = [];
+    for (const line of lines) {
+      const trimmedLine = line.trim();
+      // 跳过空行
+      if (!trimmedLine) continue;
+      // 跳过 markdown 格式行（如 1. 2. 或 ** 或 - ）
+      if (/^\d+\.?\s/.test(trimmedLine) || /^\*\*|^\* |^-\s/.test(trimmedLine)) continue;
+      // 跳过包含中文解释的行（可能是 LLM 的解释）
+      if (/[\u4e00-\u9fa5]/.test(trimmedLine) && !trimmedLine.startsWith('#') && !trimmedLine.startsWith('echo') && !trimmedLine.startsWith('ssh') && !trimmedLine.startsWith('if')) continue;
+      // 跳过包含 markdown 链接或复杂格式的行
+      if (trimmedLine.includes('```') || trimmedLine.includes('**') || trimmedLine.includes('`') && trimmedLine.length > 50) continue;
+      scriptLines.push(trimmedLine);
+    }
+    let newBody = scriptLines.join('\n');
+    // 如果过滤后是空的或太短，说明解析失败，使用原始输出
+    if (newBody.length < 20) {
+      console.log('[DEBUG] applyScriptEnhancement: LLM output parsing failed, using raw output');
+      newBody = trimmed;
+    }
+    newBody = newBody.replace(/^#!/,'echo "skip" && #!').split('\n').filter(l => !l.match(/^echo "skip"/)).join('\n');
     const newScript = shebangLines.length > 0
       ? shebangLines.join('\n') + '\n' + newBody
       : newBody;
 
-    console.log('[DEBUG] applyScriptEnhancement: LLM generated new script');
+    console.log('[DEBUG] applyScriptEnhancement: LLM generated new script, length:', newScript.length);
     return newScript;
 
   } catch(e) {
     console.log('[DEBUG] applyScriptEnhancement error:', e.message);
+    if (e.stderr) {
+      console.log('[DEBUG] applyScriptEnhancement stderr:', e.stderr.toString().slice(0, 500));
+    }
     return currentScript;
   }
 }
@@ -1132,8 +1363,8 @@ ${statsText}
 
   // 获取模型凭证
   const creds = getModelCredentials();
-  if (!creds.apiKey) {
-    console.log('[DEBUG] daily scan: skipped, no API key available');
+  if (!creds.apiKey || !creds.model) {
+    console.log('[DEBUG] daily scan: skipped, no valid credentials, apiKey:', !!creds.apiKey, 'model:', creds.model);
     return;
   }
 
@@ -1152,7 +1383,7 @@ ${statsText}
 
     // 构建Python脚本
     const escapedPrompt = prompt.replace(/'/g, "\\'");
-    const modelName = creds.model || 'MiniMax-M2.7-highspeed';
+    const modelName = creds.model;
     const pythonScript = `
 import requests
 import json
@@ -1279,8 +1510,8 @@ ${skillStats || '(无技能数据)'}
 
   // 获取模型凭证
   const creds = getModelCredentials();
-  if (!creds.apiKey) {
-    console.log('[DEBUG] analyzeWithModel: skipped, no API key available');
+  if (!creds.apiKey || !creds.model) {
+    console.log('[DEBUG] analyzeWithModel: skipped, no valid credentials, apiKey:', !!creds.apiKey, 'model:', creds.model);
     return null;
   }
 
@@ -1299,7 +1530,7 @@ ${skillStats || '(无技能数据)'}
 
     // 构建Python脚本
     const escapedPrompt = prompt.replace(/'/g, "\\'");
-    const modelName = creds.model || 'MiniMax-M2.7-highspeed';
+    const modelName = creds.model;
     const pythonScript = `
 import requests
 resp = requests.post(
@@ -2036,9 +2267,23 @@ module.exports = {
     api.on('before_agent_start', (event) => {
       console.log("[DEBUG] HOOK FIRING, event keys:", Object.keys(event || {}));
       _currentSessionKey = event.sessionKey || null; // 设置当前 sessionKey，供 getModelCredentials 使用
+      _currentPrompt = event.prompt || null; // 设置当前 prompt，用于检测 agent
+      // 捕获当前 prompt 到局部变量，防止 async 调用期间被新消息覆盖
+      const currentPrompt = event.prompt || null;
+      _detectedAgentModel = null; // 重置检测到的 model
       if (_currentSessionKey) {
         const agentModel = getAgentModelFromSession(_currentSessionKey);
-        if (agentModel) console.log('[DEBUG] agent model from session:', agentModel);
+        if (agentModel) {
+          _detectedAgentModel = agentModel;
+          console.log('[DEBUG] agent model from session:', agentModel);
+        }
+      } else if (currentPrompt) {
+        // sessionKey 不可用，尝试从 prompt 检测
+        const agentModel = detectAgentModelFromPrompt(currentPrompt);
+        if (agentModel) {
+          _detectedAgentModel = agentModel;
+          console.log('[DEBUG] agent model from prompt:', agentModel);
+        }
       }
       let result = null;
       try {
@@ -2282,42 +2527,45 @@ ${hitOutput}
       // 只在非回滚意图时检测上下文修改，避免 Python 调用失败影响回滚流程
       let contextModify = null;
       if (!hasRollbackIntent) {
-        contextModify = detectContextScriptModification(userMsg, event.messages || [], lastExecutedSkill, scriptsDir, skillsDir);
+        contextModify = detectContextScriptModification(userMsg, event.messages || [], lastExecutedSkill, scriptsDir, skillsDir, currentPrompt);
       }
       if (contextModify) {
-        console.log('[DEBUG] context script modification detected:', contextModify.reason);
-        try {
-          const { cardId, scriptPath, title, currentScript, enhancement } = contextModify;
-
-          // 生成增强后的脚本
-          const newScript = applyScriptEnhancement(title, currentScript, enhancement);
-          if (newScript && newScript !== currentScript) {
-            // 更新前先备份当前版本
-            backupScript(scriptPath);
-
+        console.log('[DEBUG] context script modification detected:', contextModify.enhancement);
+        const { cardId, scriptPath, title, currentScript, enhancement } = contextModify;
+        // 根据上下文增强脚本（使用检测到的 agent model，无硬编码）
+        const agentModel = _detectedAgentModel;
+        const newScript = applyScriptEnhancement(title, currentScript, enhancement, agentModel);
+        if (newScript && newScript !== currentScript) {
+          // 写回增强后的脚本
+          try {
             writeFileSync(scriptPath, newScript, 'utf-8');
-            chmodSync(scriptPath, 0o755);
+            result.prependContext = `💡 已根据上下文增强技能「${title}」：${enhancement}
 
-            // 记录改进日志
-            logSkillImprovement(cardId, 'context_enhancement', {
-              enhancement: enhancement,
-              scriptPath: scriptPath
-            });
+原脚本已更新，新脚本：
 
-            console.log('[DEBUG] context script updated for card:', cardId, 'enhancement:', enhancement);
-
-            result.prependContext = `🔧 已根据上下文自动增强技能脚本：
-📌 技能：${title}
-💡 增强：${enhancement}
-
-脚本已更新，下次执行会使用增强版本~ 如需回滚，说"回到上一个版本"
+\`\`\`bash
+${newScript}
+\`\`\`
 
 ---
 `;
-            cache.ts = 0;
+          } catch(e) {
+            console.log('[DEBUG] failed to write enhanced script:', e.message);
+            result.prependContext = `💡 用户想要增强技能「${title}」：${enhancement}
+
+AI 可选择：执行脚本来验证，或更新脚本，或忽略
+
+---
+`;
           }
-        } catch(e) {
-          console.log('[DEBUG] context modification error:', e.message);
+        } else {
+          // 无法增强，通知 AI 处理
+          result.prependContext = `💡 用户想要增强技能「${title}」：${enhancement}
+
+AI 可选择：执行脚本来验证，或更新脚本，或忽略
+
+---
+`;
         }
       }
 
