@@ -174,6 +174,89 @@ function generateScriptFromFeedback(feedback, title, currentScript) {
   return newScript;
 }
 
+// ==================== 自动分析执行结果并优化脚本 ====================
+async function analyzeAndOptimizeScript(cardId, scriptPath, title, output) {
+  try {
+    // 检查输出是否为空或过短（可能不完整）
+    if (!output || output.trim().length < 10) {
+      console.log('[DEBUG] analyzeAndOptimize: output too short, skipping');
+      return;
+    }
+
+    // 简单的启发式分析
+    const titleLower = (title || '').toLowerCase();
+    let needsMore = false;
+    let suggestion = '';
+
+    // 内存相关检查
+    if (titleLower.includes('内存') || titleLower.includes('mem')) {
+      if (!output.includes('Mem:') && !output.includes('内存')) {
+        needsMore = true;
+        suggestion = '添加 free -h 显示内存总量和使用情况';
+      }
+      if (!output.includes('Swap:') && !output.includes('swap') && !output.includes('交换')) {
+        needsMore = true;
+        suggestion = '添加 swap 使用情况显示';
+      }
+    }
+
+    // CPU相关检查
+    if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
+      if (!output.includes('CPU') && !output.includes('cpu')) {
+        needsMore = true;
+        suggestion = '添加 lscpu 显示 CPU 信息';
+      }
+    }
+
+    // 进程相关检查
+    if (titleLower.includes('进程') || titleLower.includes('process')) {
+      if (!output.includes('PID') && !output.includes('USER')) {
+        needsMore = true;
+        suggestion = '添加完整的进程列表';
+      }
+    }
+
+    if (!needsMore) {
+      console.log('[DEBUG] analyzeAndOptimize: output looks good for', title);
+      return;
+    }
+
+    console.log('[DEBUG] analyzeAndOptimize: suggesting improvement:', suggestion);
+
+    // 根据建议生成优化后的脚本
+    let newScript = '#!/bin/bash\n# Auto-generated skill script (optimized)\n# Problem: ' + title + '\n';
+
+    if (titleLower.includes('内存') || titleLower.includes('mem')) {
+      newScript += 'echo "=== 内存使用情况 ===" && free -h && echo "=== Swap 使用情况 ===" && swapon --show && echo "=== 进程内存使用 Top15 ===" && ps aux --sort=-%mem | head -16';
+    } else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
+      newScript += 'echo "=== CPU 信息 ===" && lscpu && echo "=== CPU 使用 Top10 ===" && ps aux --sort=-%cpu | head -11';
+    } else if (titleLower.includes('磁盘') || titleLower.includes('disk')) {
+      newScript += 'df -h && echo "=== 目录占用 Top10 ===" && du -sh /* 2>/dev/null | sort -hr | head -10';
+    } else if (titleLower.includes('进程') || titleLower.includes('process')) {
+      newScript += 'ps aux && echo "=== 进程树 ===" && pstree -p && echo "=== 资源 Top10 ===" && ps aux --sort=-%mem | head -11';
+    } else {
+      newScript += output.split('\n')[0]; // 保留原有输出
+    }
+
+    // 更新脚本
+    writeFileSync(scriptPath, newScript, 'utf-8');
+    chmodSync(scriptPath, 0o755);
+    console.log('[DEBUG] analyzeAndOptimize: script updated for card:', cardId);
+
+    // 记录优化日志
+    const logsDir = join(getDataDir(), 'logs');
+    if (!existsSync(logsDir)) {
+      require('fs').mkdirSync(logsDir, { recursive: true });
+    }
+    const logFile = join(logsDir, 'optimize.log');
+    const logEntry = `[${new Date().toISOString()}]优化技能 ${cardId} (${title}): ${suggestion}\n`;
+    appendFileSync(logFile, logEntry, 'utf-8');
+
+  } catch(e) {
+    console.log('[DEBUG] analyzeAndOptimize error:', e.message);
+  }
+}
+
 // ==================== 工作流模式识别（模型判断） ====================
 const WORKFLOW_DIR = join(process.env.OPENCLAW_STATE_DIR || (process.env.HOME || '/root') + '/.openclaw', '.auto-skill', 'workflows');
 const WORKFLOW_SEQ_TTL = 30 * 60 * 1000; // 30分钟会话窗口
@@ -1597,6 +1680,13 @@ ${hitOutput}
           // 记录最近执行的技能（用于反馈优化）
           const currentScript = existsSync(scriptPath) ? readFileSync(scriptPath, 'utf-8') : '';
           setLastExecutedSkill(r.id, scriptPath, r.title, currentScript);
+
+          // 自动分析执行结果，决定是否优化脚本（异步，不阻塞）
+          if (execResult.success) {
+            analyzeAndOptimizeScript(r.id, scriptPath, r.title, execResult.stdout).catch(e => {
+              console.log('[DEBUG] analyzeAndOptimize error:', e.message);
+            });
+          }
 
           // 记录执行结果（方案E）
           try {
