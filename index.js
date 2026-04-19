@@ -124,129 +124,124 @@ function getRecentExecutedScript() {
   return lastExecutedSkill;
 }
 
-// ==================== 上下文感知的脚本修改检测（Hermes式） ====================
+// ==================== 上下文感知的脚本修改检测（通用网关级别） ====================
 function detectContextScriptModification(userMsg, messages, recentSkill) {
   if (!recentSkill) return null;
 
   const { cardId, scriptPath, title, currentScript } = recentSkill;
-  const titleLower = (title || '').toLowerCase();
   const msgLower = (userMsg || '').toLowerCase();
 
-  // 检查用户消息是否包含增强意图
-  const enhancePatterns = [
-    /还要|再加|再增加|还要显示|还要加|应该加|应该还有|也要|加上/,
-    /不对|不是|应该|改一下|修改|更新/,
-    /增加|增强|加一个|加个|多一个/
+  // 检查用户消息是否包含增强/修改意图（通用模式）
+  const enhanceIntentPatterns = [
+    /^还要/,
+    /^应该还要/,
+    /^应该加/,
+    /^不对.*应该/,
+    /^不是.*应该/,
+    /^增加/,
+    /^加上/,
+    /^再加/,
+    /^再多/,
+    /^加一个/,
+    /^加个/,
+    /^补充/,
+    /^改一下/,
+    /^修改/,
+    /^不对/,
+    /^不是这样/,
+    /^说错了/
   ];
-  const hasEnhanceIntent = enhancePatterns.some(p => p.test(userMsg));
 
-  if (!hasEnhanceIntent) return null;
+  const hasEnhanceIntent = enhanceIntentPatterns.some(p => p.test(userMsg.trim()));
 
-  // 检查消息是否与当前技能相关（通过最近的对话上下文判断）
-  // 提取用户消息中的关键实体
-  let entity = '';
-  if (titleLower.includes('内存') || titleLower.includes('mem')) {
-    entity = '内存';
-  } else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
-    entity = 'cpu';
-  } else if (titleLower.includes('磁盘') || titleLower.includes('disk')) {
-    entity = '磁盘';
-  } else if (titleLower.includes('进程') || titleLower.includes('process')) {
-    entity = '进程';
-  }
+  // 如果没有明确的增强意图，检查是否在5分钟内执行过技能且消息与技能相关
+  if (!hasEnhanceIntent) {
+    const timeCheck = Date.now() - recentSkill.ts <= 5 * 60 * 1000;
+    if (!timeCheck) return null;
 
-  // 从用户消息中提取想要的增强内容
-  let enhancement = '';
-  if (/swap|交换/.test(msgLower)) enhancement = '添加swap使用情况';
-  else if (/详细|完整|更多/.test(msgLower)) enhancement = '添加更详细的信息';
-  else if (/cpu|处理器/.test(msgLower)) enhancement = '添加CPU信息';
-  else if (/磁盘|硬盘|disk/.test(msgLower)) enhancement = '添加磁盘使用情况';
-  else if (/进程|process/.test(msgLower)) enhancement = '添加进程列表';
-  else if (/内存|mem/.test(msgLower)) enhancement = '添加内存详细信息';
-  else if (/网络|net/.test(msgLower)) enhancement = '添加网络状态';
-  else if (/端口|port/.test(msgLower)) enhancement = '添加端口占用';
-  else if (/日志|log/.test(msgLower)) enhancement = '添加日志查看';
-  else if (/服务|service/.test(msgLower)) enhancement = '添加服务状态';
+    // 检查消息是否与技能标题相关
+    const titleKeywords = (title || '').replace(/[^\w\u4e00-\u9fa5]/g, ' ').split(/\s+/).filter(Boolean);
+    const isRelated = titleKeywords.some(k => k.length >= 2 && msgLower.includes(k));
+    if (!isRelated) return null;
 
-  if (!enhancement) return null;
-
-  // 检查消息是否在上下文会话中（与技能相关）
-  // 通过检查之前的对话是否包含相关关键词
-  const contextRelevant = messages.some(m => {
-    const content = (m.content || '').toLowerCase();
-    return content.includes(entity) || content.includes(titleLower.slice(0, 5));
-  });
-
-  if (!contextRelevant && messages.length > 2) {
-    // 如果消息与上下文完全不相关，可能不是反馈
     return null;
   }
+
+  // 提取用户想要的增强内容（去掉命令词，保留核心需求）
+  let enhancement = userMsg
+    .replace(/^(还要|应该还要|应该加|不对.*应该|不是.*应该|增加|加上|再加|再多|加一个|加个|补充|改一下|修改|不对|不是这样|说错了)\s*/i, '')
+    .trim();
+
+  if (!enhancement || enhancement.length < 1) return null;
 
   return { cardId, scriptPath, title, currentScript, enhancement };
 }
 
+// ==================== 通用脚本增强函数（网关级别） ====================
 function applyScriptEnhancement(title, currentScript, enhancement) {
-  const titleLower = (title || '').toLowerCase();
-  let newScript = currentScript;
+  // 通用增强逻辑：不限定技能类型，根据用户需求智能增强
+  const enhLower = (enhancement || '').toLowerCase();
 
-  // 内存技能增强
-  if (titleLower.includes('内存') || titleLower.includes('mem')) {
-    if (enhancement.includes('swap') || enhancement.includes('交换')) {
-      if (!currentScript.includes('swapon')) {
-        newScript = currentScript.replace(
-          /ps aux --sort=-%mem \| head -\d*/,
-          'free -h && echo "---" && swapon --show && echo "---" && ps aux --sort=-%mem | head -11'
-        );
-      }
-    }
-    if (enhancement.includes('详细')) {
-      if (!currentScript.includes('top')) {
-        newScript = currentScript.replace(
-          /ps aux --sort=-%mem \| head -\d*/,
-          'echo "=== 内存概览 ===" && free -h && echo "=== Swap ===" && swapon --show && echo "=== 进程 Top15 ===" && top -b -n 1 | head -20'
-        );
-      }
-    }
-  }
-  // CPU技能增强
-  else if (titleLower.includes('cpu') || titleLower.includes('处理器')) {
-    if (enhancement.includes('CPU') || enhancement.includes('信息')) {
-      if (!currentScript.includes('lscpu')) {
-        newScript = currentScript.replace(
-          /ps aux --sort=-%cpu \| head -\d*/,
-          'lscpu && echo "---" && ps aux --sort=-%cpu | head -11'
-        );
-      }
-    }
-  }
-  // 磁盘技能增强
-  else if (titleLower.includes('磁盘') || titleLower.includes('disk')) {
-    if (enhancement.includes('磁盘') || enhancement.includes('使用')) {
-      if (!currentScript.includes('du -sh')) {
-        newScript = currentScript.replace(
-          /df -h/,
-          'df -h && echo "---" && du -sh /* 2>/dev/null | sort -hr | head -10'
-        );
-      }
-    }
-  }
-  // 进程技能增强
-  else if (titleLower.includes('进程') || titleLower.includes('process')) {
-    if (enhancement.includes('进程') || enhancement.includes('列表')) {
-      if (!currentScript.includes('pstree')) {
-        newScript = currentScript.replace(
-          /ps aux/,
-          'ps aux && echo "---" && pstree -p'
-        );
-      }
+  // 常见的增强关键词 → 对应命令
+  const enhancementMap = {
+    'swap': 'swapon --show && echo "---" && ',
+    '交换': 'swapon --show && echo "---" && ',
+    '磁盘': 'df -h && echo "---" && ',
+    '硬盘': 'df -h && echo "---" && ',
+    'disk': 'df -h && echo "---" && ',
+    '内存': 'free -h && echo "---" && ',
+    'mem': 'free -h && echo "---" && ',
+    'cpu': 'lscpu && echo "---" && ',
+    '进程': 'ps aux && echo "---" && ',
+    'process': 'ps aux && echo "---" && ',
+    '网络': 'netstat -tuln && echo "---" && ',
+    'net': 'netstat -tuln && echo "---" && ',
+    '端口': 'netstat -tuln && echo "---" && ',
+    'port': 'netstat -tuln && echo "---" && ',
+    '连接': 'ss -tuln && echo "---" && ',
+    '服务': 'systemctl list-units --type=service && echo "---" && ',
+    'service': 'systemctl list-units --type=service && echo "---" && ',
+    '日志': 'journalctl -n 20 && echo "---" && ',
+    'log': 'journalctl -n 20 && echo "---" && ',
+    '错误': 'dmesg | tail -20 && echo "---" && ',
+    'error': 'dmesg | tail -20 && echo "---" && ',
+    'top': 'top -b -n 1 | head -20 && echo "---" && ',
+    '负载': 'uptime && echo "---" && w && echo "---" && ',
+    'load': 'uptime && echo "---" && w && echo "---" && ',
+    'io': 'iostat -x 1 1 && echo "---" && ',
+    '磁盘io': 'iostat -x 1 1 && echo "---" && ',
+    '网络io': 'sar -n DEV 1 1 && echo "---" && '
+  };
+
+  // 找到匹配的增强关键词
+  let prefixCmd = '';
+  for (const [keyword, cmd] of Object.entries(enhancementMap)) {
+    if (enhLower.includes(keyword)) {
+      prefixCmd = cmd;
+      break;
     }
   }
 
-  if (newScript === currentScript) {
-    console.log('[DEBUG] applyScriptEnhancement: no change applied');
+  if (!prefixCmd) {
+    console.log('[DEBUG] applyScriptEnhancement: no matching enhancement for:', enhancement);
     return currentScript;
   }
 
+  // 如果当前脚本已经有类似的命令，不再重复添加
+  if (currentScript.includes(prefixCmd.trim())) {
+    console.log('[DEBUG] applyScriptEnhancement: command already exists');
+    return currentScript;
+  }
+
+  // 在脚本开头添加增强命令（添加分隔符）
+  const shebang = currentScript.startsWith('#!') ? currentScript.split('\n').slice(0, 2).join('\n') + '\n' : '';
+  const scriptBody = shebang ? currentScript.split('\n').slice(2).join('\n') : currentScript;
+
+  const newScript = shebang
+    ? shebang + prefixCmd + scriptBody
+    : prefixCmd + scriptBody;
+
+  console.log('[DEBUG] applyScriptEnhancement: applied:', enhancement, '-> prefix:', prefixCmd.trim());
   return newScript;
 }
 
