@@ -1608,7 +1608,10 @@ module.exports = {
       refreshCache();
 
       result = {
-        prependSystemContext: `💡 经验系统：遇问题搜经验 python3 ${scriptsDir}/autoskill-search "关键词"，解决后记录 bash ${scriptsDir}/autoskill-record --title "标题" --tool "工具" --problem "问题" --solution "方案"`
+        prependSystemContext: `💡 经验系统：遇问题搜经验 python3 ${scriptsDir}/autoskill-search "关键词"，解决后记录 bash ${scriptsDir}/autoskill-record --title "标题" --tool "工具" --problem "问题" --solution "方案"
+
+🔧 技能改进：如果执行脚本后结果不完整、有错误、或者用户有新需求，可以用 python3 ${scriptsDir}/autoskill-enhance 改进脚本。发现技能过时或有问题时，主动更新。
+`
       };
 
       // ========== 触发条件：检测到错误 或 用户消息 ==========
