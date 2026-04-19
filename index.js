@@ -19,6 +19,50 @@ const { execSync } = require('child_process');
 const { existsSync, readFileSync, readdirSync, statSync, writeFileSync, chmodSync, copyFileSync, unlinkSync } = require('fs');
 const { join } = require('path');
 
+// ==================== 网关配置读取 ====================
+function getGatewayConfig() {
+  try {
+    const configPath = process.env.OPENCLAW_STATE_DIR 
+      ? join(process.env.OPENCLAW_STATE_DIR, 'openclaw.json')
+      : join(require('os').homedir(), '.openclaw-gateway2', 'openclaw.json');
+    if (existsSync(configPath)) {
+      return JSON.parse(readFileSync(configPath, 'utf-8'));
+    }
+  } catch(e) {}
+  return null;
+}
+
+function getModelCredentials() {
+  // 默认使用 MiniMax 的凭证
+  const config = getGatewayConfig();
+  if (config && config.models && config.models.providers) {
+    // 优先使用 minimax-portal 的配置
+    const minimax = config.models.providers['minimax-portal'];
+    if (minimax) {
+      return {
+        baseUrl: minimax.baseUrl || 'https://api.minimaxi.com/anthropic',
+        apiKey: process.env.MINIMAX_API_KEY || '',
+        authHeader: minimax.authHeader || false
+      };
+    }
+    // 回退到 zai provider
+    const zai = config.models.providers['zai'];
+    if (zai) {
+      return {
+        baseUrl: zai.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
+        apiKey: zai.apiKey || '',
+        authHeader: false
+      };
+    }
+  }
+  // 回退到环境变量
+  return {
+    baseUrl: process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic',
+    apiKey: process.env.MINIMAX_API_KEY || '',
+    authHeader: false
+  };
+}
+
 // ==================== 脚本版本备份 ====================
 const MAX_BACKUP_VERSIONS = 2;
 
@@ -427,21 +471,37 @@ ${contextText}
   try {
     // 使用临时文件传递prompt，避免引号转义问题
     const tmpFile = '/tmp/autoskill_prompt_' + Date.now() + '.txt';
+    const credsFile = '/tmp/autoskill_creds_' + Date.now() + '.json';
     writeFileSync(tmpFile, prompt, 'utf-8');
+    
+    // 获取模型凭证
+    const creds = getModelCredentials();
+    const apiKey = creds.apiKey || process.env.MINIMAX_API_KEY || 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA';
+    const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
+    
+    // 构建请求头并写入临时文件
+    const headers = {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+    if (creds.authHeader) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    } else {
+      headers['x-api-key'] = apiKey;
+    }
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl }), 'utf-8');
     
     const result = execSync(`python3 -W ignore -c "
 import requests
 import json
 with open('${tmpFile}', 'r') as f:
     prompt = f.read()
+with open('${credsFile}', 'r') as f:
+    creds = json.load(f)
 resp = requests.post(
-    'https://api.minimaxi.com/anthropic/v1/messages',
-    headers={
-        'Content-Type': 'application/json',
-        'x-api-key': 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA',
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-    },
+    creds['baseUrl'] + '/v1/messages',
+    headers=creds['headers'],
     json={
         'model': 'MiniMax-M2.7',
         'max_tokens': 100,
@@ -458,7 +518,7 @@ else:
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
 
     // 清理临时文件
-    try { unlinkSync(tmpFile); } catch(e) {}
+    try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {}
 
     const trimmed = result.trim();
     console.log('[DEBUG] LLM enhancement check:', trimmed.slice(0, 100));
@@ -529,21 +589,37 @@ ${scriptBody}
   try {
     // 使用临时文件传递prompt，避免引号转义问题
     const tmpFile = '/tmp/autoskill_enhance_' + Date.now() + '.txt';
+    const credsFile = '/tmp/autoskill_creds_' + Date.now() + '.json';
     writeFileSync(tmpFile, prompt, 'utf-8');
+    
+    // 获取模型凭证
+    const creds = getModelCredentials();
+    const apiKey = creds.apiKey || process.env.MINIMAX_API_KEY || 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA';
+    const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
+    
+    // 构建请求头并写入临时文件
+    const headers = {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+    if (creds.authHeader) {
+      headers['Authorization'] = `Bearer ${apiKey}`;
+    } else {
+      headers['x-api-key'] = apiKey;
+    }
+    writeFileSync(credsFile, JSON.stringify({ headers, baseUrl }), 'utf-8');
     
     const result = execSync(`python3 -W ignore -c "
 import requests
 import json
 with open('${tmpFile}', 'r') as f:
     prompt = f.read()
+with open('${credsFile}', 'r') as f:
+    creds = json.load(f)
 resp = requests.post(
-    'https://api.minimaxi.com/anthropic/v1/messages',
-    headers={
-        'Content-Type': 'application/json',
-        'x-api-key': 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA',
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-    },
+    creds['baseUrl'] + '/v1/messages',
+    headers=creds['headers'],
     json={
         'model': 'MiniMax-M2.7',
         'max_tokens': 500,
@@ -559,14 +635,14 @@ else:
     print('ERROR')
 " 2>&1`, { encoding: 'utf-8', timeout: 20000 });
 
-    // 清理临时文件
-    try { unlinkSync(tmpFile); } catch(e) {}
-
     const trimmed = result.trim();
     if (trimmed === 'ERROR' || !trimmed) {
       console.log('[DEBUG] applyScriptEnhancement: LLM call failed');
+      try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {}
       return currentScript;
     }
+    // 清理临时文件
+    try { unlinkSync(tmpFile); unlinkSync(credsFile); } catch(e) {}
 
     // 重建完整脚本（保留shebang和注释）
     const newBody = trimmed.replace(/^#!/,'echo "skip" && #!').split('\n').filter(l => !l.match(/^echo "skip"/)).join('\n');
