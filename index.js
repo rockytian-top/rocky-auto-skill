@@ -33,31 +33,45 @@ function getGatewayConfig() {
 }
 
 function getModelCredentials() {
+  // 优先使用环境变量中的OAuth token（网关正常运行minimax的关键）
+  const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
+  if (authToken) {
+    return {
+      baseUrl: process.env.ANTHROPIC_BASE_URL || 'https://api.minimaxi.com/anthropic',
+      apiKey: authToken,
+      authHeader: true,  // 使用 Bearer token
+      apiType: 'anthropic'
+    };
+  }
+
   // 从网关配置读取模型凭证
   const config = getGatewayConfig();
   if (config && config.models && config.models.providers) {
     // 优先使用有完整配置的 provider（baseUrl + apiKey）
-    // zai 配置完整，优先使用
     const zai = config.models.providers['zai'];
     if (zai && zai.apiKey) {
       return {
         baseUrl: zai.baseUrl || 'https://open.bigmodel.cn/api/coding/paas/v4',
         apiKey: zai.apiKey,
         authHeader: false,
-        apiType: 'openai'  // zai 用 OpenAI 格式
+        apiType: 'openai'
       };
     }
-    // minimax-portal 没有 apiKey，需要环境变量
-    const minimax = config.models.providers['minimax-portal'];
-    if (minimax) {
-      return {
-        baseUrl: minimax.baseUrl || 'https://api.minimaxi.com/anthropic',
-        apiKey: process.env.MINIMAX_API_KEY || '',
-        authHeader: minimax.authHeader || false,
-        apiType: 'anthropic'  // minimax-portal 用 Anthropic 格式
-      };
+    // minimax-portal 或其他 provider
+    const providerNames = Object.keys(config.models.providers);
+    for (const name of providerNames) {
+      const p = config.models.providers[name];
+      if (p && (p.apiKey || p.authHeader)) {
+        return {
+          baseUrl: p.baseUrl || 'https://api.minimaxi.com/anthropic',
+          apiKey: p.apiKey || '',
+          authHeader: p.authHeader || false,
+          apiType: (p.api && p.api.includes('openai')) ? 'openai' : 'anthropic'
+        };
+      }
     }
   }
+
   // 回退到环境变量
   return {
     baseUrl: process.env.MINIMAX_BASE_URL || 'https://api.minimaxi.com/anthropic',
@@ -480,7 +494,12 @@ ${contextText}
     
     // 获取模型凭证
     const creds = getModelCredentials();
-    const apiKey = creds.apiKey || process.env.MINIMAX_API_KEY || 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA';
+    if (!creds.apiKey) {
+      console.log('[DEBUG] LLM enhancement skipped: no API key available in config or env MINIMAX_API_KEY');
+      try { unlinkSync(tmpFile); } catch(e) {}
+      return null;
+    }
+    const apiKey = creds.apiKey;
     const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
     const apiType = creds.apiType || 'anthropic';
     
@@ -622,7 +641,12 @@ ${scriptBody}
     
     // 获取模型凭证
     const creds = getModelCredentials();
-    const apiKey = creds.apiKey || process.env.MINIMAX_API_KEY || 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA';
+    if (!creds.apiKey) {
+      console.log('[DEBUG] LLM enhancement skipped: no API key available in config or env MINIMAX_API_KEY');
+      try { unlinkSync(tmpFile); } catch(e) {}
+      return null;
+    }
+    const apiKey = creds.apiKey;
     const baseUrl = creds.baseUrl || 'https://api.minimaxi.com/anthropic';
     const apiType = creds.apiType || 'anthropic';
     
@@ -994,26 +1018,45 @@ ${statsText}
 
 只输出指令。`;
 
+  // 获取模型凭证
+  const creds = getModelCredentials();
+  if (!creds.apiKey) {
+    console.log('[DEBUG] daily scan: skipped, no API key available');
+    return;
+  }
+
   try {
-    const result = execSync(`python3 -W ignore -c "
+    // 构建请求头
+    const headers = {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+    if (creds.authHeader) {
+      headers['Authorization'] = `Bearer ${creds.apiKey}`;
+    } else {
+      headers['x-api-key'] = creds.apiKey;
+    }
+
+    // 构建Python脚本
+    const escapedPrompt = prompt.replace(/'/g, "\\'");
+    const pythonScript = `
 import requests
+import json
 resp = requests.post(
-    'https://api.minimaxi.com/anthropic/v1/messages',
-    headers={
-        'Content-Type': 'application/json',
-        'x-api-key': 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA',
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-    },
+    '${creds.baseUrl}/v1/messages',
+    headers=${JSON.stringify(headers)},
     json={
         'model': 'MiniMax-M2.7-highspeed',
         'max_tokens': 2000,
-        'messages': [{'role': 'user', 'content': '''${prompt.replace(/'/g, "\\'")}'''}]
+        'messages': [{'role': 'user', 'content': '${escapedPrompt}'}]
     },
     timeout=60
 )
 print(resp.json()['content'][0]['text'][:4000])
-" 2>/dev/null`, { encoding: 'utf-8', timeout: 70000 });
+`;
+
+    const result = execSync(`python3 -W ignore -c "${pythonScript}" 2>/dev/null`, { encoding: 'utf-8', timeout: 70000 });
 
     // 解析删除指令
     const deleteMatch = result.match(/\[DECAY_DELETE\]\s*([\s\S]*?)\s*\[\/DECAY_DELETE\]/);
@@ -1114,26 +1157,44 @@ ${skillStats || '(无技能数据)'}
 
 只输出指令，不要其他内容。`;
 
+  // 获取模型凭证
+  const creds = getModelCredentials();
+  if (!creds.apiKey) {
+    console.log('[DEBUG] analyzeWithModel: skipped, no API key available');
+    return null;
+  }
+
   try {
-    const result = execSync(`python3 -W ignore -c "
+    // 构建请求头
+    const headers = {
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    };
+    if (creds.authHeader) {
+      headers['Authorization'] = `Bearer ${creds.apiKey}`;
+    } else {
+      headers['x-api-key'] = creds.apiKey;
+    }
+
+    // 构建Python脚本
+    const escapedPrompt = prompt.replace(/'/g, "\\'");
+    const pythonScript = `
 import requests
 resp = requests.post(
-    'https://api.minimaxi.com/anthropic/v1/messages',
-    headers={
-        'Content-Type': 'application/json',
-        'x-api-key': 'f0478a9dc1554fbe84b794e9528c6900.elAEl9DP520WLtaA',
-        'anthropic-version': '2023-06-01',
-        'anthropic-dangerous-direct-browser-access': 'true'
-    },
+    '${creds.baseUrl}/v1/messages',
+    headers=${JSON.stringify(headers)},
     json={
         'model': 'MiniMax-M2.7-highspeed',
         'max_tokens': 2000,
-        'messages': [{'role': 'user', 'content': '''${prompt.replace(/'/g, "\\'")}'''}]
+        'messages': [{'role': 'user', 'content': '${escapedPrompt}'}]
     },
     timeout=60
 )
 print(resp.json()['content'][0]['text'][:4000])
-" 2>/dev/null`, { encoding: 'utf-8', timeout: 70000 });
+`;
+
+    const result = execSync(`python3 -W ignore -c "${pythonScript}" 2>/dev/null`, { encoding: 'utf-8', timeout: 70000 });
 
     const jsonMatch = result.match(/\{[\s\S]*\}/);
     if (jsonMatch) {
