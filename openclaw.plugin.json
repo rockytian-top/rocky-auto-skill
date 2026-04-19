@@ -2,7 +2,7 @@
   "id": "rocky-auto-skill",
   "name": "Auto Skill",
   "description": "\u81ea\u52a8\u7ecf\u9a8c\u641c\u7d22\u4e0e\u8bb0\u5f55 \u2014 \u68c0\u6d4b\u9519\u8bef\u81ea\u52a8\u641c\u7d22\u7ecf\u9a8c\uff0c\u89e3\u51b3\u540e\u81ea\u52a8\u63d0\u793a\u8bb0\u5f55",
-  "version": "2.9.1",
+  "version": "3.0.0",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
