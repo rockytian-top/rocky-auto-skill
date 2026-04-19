@@ -1113,6 +1113,7 @@ module.exports = {
 
       const dataDir = getDataDir();
       const skillsDir = join(dataDir, 'skills');
+      const cardsDir = join(dataDir, 'cards');
 
       refreshCache();
 
