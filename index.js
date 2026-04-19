@@ -48,7 +48,7 @@ function autoInstall() {
       for (const src of srcDirs) {
         if (existsSync(src)) {
           try {
-            execSync('cp -r "' + src + '/*" "' + scriptsDir + '/" 2>/dev/null || true');
+            execSync('cp -r "' + src + '/." "' + scriptsDir + '/" 2>/dev/null || true');
             console.log('[DEBUG] autoInstall: copied scripts from ' + src);
             installed = true;
             break;
