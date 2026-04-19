@@ -429,7 +429,7 @@ ${contextText}
     const tmpFile = '/tmp/autoskill_prompt_' + Date.now() + '.txt';
     writeFileSync(tmpFile, prompt, 'utf-8');
     
-    const result = execSync(`python3 -c "
+    const result = execSync(`python3 -W ignore -c "
 import requests
 import json
 with open('${tmpFile}', 'r') as f:
@@ -531,7 +531,7 @@ ${scriptBody}
     const tmpFile = '/tmp/autoskill_enhance_' + Date.now() + '.txt';
     writeFileSync(tmpFile, prompt, 'utf-8');
     
-    const result = execSync(`python3 -c "
+    const result = execSync(`python3 -W ignore -c "
 import requests
 import json
 with open('${tmpFile}', 'r') as f:
@@ -867,7 +867,7 @@ ${statsText}
 只输出指令。`;
 
   try {
-    const result = execSync(`python3 -c "
+    const result = execSync(`python3 -W ignore -c "
 import requests
 resp = requests.post(
     'https://api.minimaxi.com/anthropic/v1/messages',
@@ -987,7 +987,7 @@ ${skillStats || '(无技能数据)'}
 只输出指令，不要其他内容。`;
 
   try {
-    const result = execSync(`python3 -c "
+    const result = execSync(`python3 -W ignore -c "
 import requests
 resp = requests.post(
     'https://api.minimaxi.com/anthropic/v1/messages',
