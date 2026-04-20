@@ -1991,15 +1991,13 @@ function extractUserMessageKeywords(messages) {
 function extractUserMessageKeywordsFromPrompt(promptStr) {
   if (!promptStr || typeof promptStr !== 'string') return '';
 
-  // 用户消息在 <<<END_OPENCLAW_INTERNAL_CONTEXT>>> 标记之后，格式如：
-  // [Sun 2026-04-19 08:04 GMT+8] 用户消息内容
   const marker = '<<<END_OPENCLAW_INTERNAL_CONTEXT>>>';
   const markerIdx = promptStr.lastIndexOf(marker);
-  const searchStr = markerIdx >= 0 ? promptStr.slice(markerIdx + marker.length) : promptStr.slice(-500);
+  const searchStr = markerIdx >= 0 ? promptStr.slice(markerIdx + marker.length) : promptStr.slice(-2000);
   const lines = searchStr.split('\n');
 
-  // 收集所有可能是用户消息的行
   const candidates = [];
+  let inJsonBlock = false;
 
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
@@ -2008,20 +2006,26 @@ function extractUserMessageKeywordsFromPrompt(promptStr) {
     if (trimmed.length === 0) continue;
     const trimmedLower = trimmed.toLowerCase();
 
-    // 跳过系统内部内容
-    if (trimmed.startsWith('{') || trimmed.startsWith('```') || trimmed.startsWith('"') ||
-        trimmed === '"' ||
-        trimmedLower.includes('conversation info') || trimmedLower.includes('timestamp') ||
-        trimmedLower.includes('sender') || trimmedLower.includes('message_id') ||
-        trimmedLower.includes('return your response as plain text')) {
-      continue;
-    }
+    // 跳过 markdown code block 标记
+    if (trimmed === '```' || trimmed.startsWith('```json') || trimmed.startsWith('``` ')) continue;
 
-    // 处理 [时间戳] 用户消息 格式：提取 ] 之后的内容
+    // 跟踪 JSON 块（metadata 区域）
+    if (trimmed === '{') { inJsonBlock = true; continue; }
+    if (trimmed === '}') { inJsonBlock = true; continue; }
+    if (inJsonBlock && (trimmed.startsWith('"') || /^[a-z_]+:/i.test(trimmed))) continue;
+    if (inJsonBlock) inJsonBlock = false;
+
+    // 跳过系统 metadata 行
+    if (trimmed.startsWith('[message_id:') ||
+        trimmedLower.includes('conversation info') || trimmedLower.includes('(untrusted metadata)') ||
+        trimmedLower.includes('sender (untrusted') ||
+        trimmedLower.includes('return your response as plain text')) continue;
+
+    // 处理 [时间戳] 用户消息 格式
     if (trimmed.startsWith('[') && trimmed.includes(']')) {
       const bracketIdx = trimmed.indexOf(']');
       const afterBracket = trimmed.slice(bracketIdx + 1).trim();
-      if (afterBracket.length > 0) {
+      if (afterBracket.length > 0 && /[\u4e00-\u9fa5a-zA-Z]/.test(afterBracket)) {
         candidates.push(afterBracket.replace(/[""]$/, '').slice(0, 80));
         continue;
       }
@@ -2029,19 +2033,16 @@ function extractUserMessageKeywordsFromPrompt(promptStr) {
 
     if (!/[\u4e00-\u9fa5a-zA-Z]/.test(trimmed)) continue;
 
-    const colonIdx = trimmed.indexOf(':');
-    if (colonIdx > 0 && colonIdx < 30) {
-      const content = trimmed.slice(colonIdx + 1).trim();
-      if (content.length > 0) {
-        candidates.push(content.slice(0, 80));
-        continue;
-      }
+    // 提取冒号后的内容（如 "Rocky: 下载目录有多少个文件"）
+    const colonMatch = trimmed.match(/^[^:]{1,20}:\s*(.+)/);
+    if (colonMatch && colonMatch[1].trim().length > 0) {
+      candidates.push(colonMatch[1].trim().slice(0, 80));
+      continue;
     }
 
     candidates.push(trimmed.slice(0, 80));
   }
 
-  // 返回最后一个候选项（最近的用户消息）
   return candidates.length > 0 ? candidates[candidates.length - 1] : '';
 }
 
@@ -2303,10 +2304,19 @@ module.exports = {
       };
 
       // ========== 触发条件：检测到错误 或 用户消息 ==========
-      const errorMsg = extractLastError(event.messages || []);
+      const _msgs = event.messages || [];
+      const errorMsg = extractLastError(_msgs);
+      // DEBUG: 打印 messages 数组最后2条
+      if (_msgs.length > 0) {
+        const last2 = _msgs.slice(-2).map(m => ({ role: m.role, content: typeof m.content === 'string' ? m.content.slice(0, 120) : JSON.stringify(m.content).slice(0, 120) }));
+        console.log('[DEBUG] messages last 2:', JSON.stringify(last2));
+      }
       const userMsgStr = typeof event.prompt === 'string' ? event.prompt : '';
-      console.log("[DEBUG] userMsgStr length:", userMsgStr.length, "prompt slice:", userMsgStr.slice(-100));
-      const userMsg = extractUserMessageKeywordsFromPrompt(userMsgStr);
+      // 优先从 messages 数组提取用户消息（更准确），再用 prompt 补充
+      let userMsg = extractUserMessageKeywords(_msgs);
+      if (!userMsg || userMsg.length < 2) {
+        userMsg = extractUserMessageKeywordsFromPrompt(userMsgStr);
+      }
       console.log("[DEBUG] extracted userMsg:", JSON.stringify(userMsg), "len:", userMsg.length);
 
       // ========== 自然语言意图检测 ==========
